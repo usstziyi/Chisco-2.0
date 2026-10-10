@@ -21,6 +21,7 @@ day 编号与数据的对应关系：
 import argparse
 import os
 import re
+import unicodedata
 from pathlib import Path
 from collections import Counter
 
@@ -296,6 +297,12 @@ def text_sentences_for(task: str, run_number: int) -> list[str]:
 
     return pd.read_excel(text_file)["句子"].astype(str).tolist()
 
+def count_nonpunct_chars(sentence: str) -> int:
+    """统计句子中非标点符号字符的个数（Unicode Punctuation 类别不算）。"""
+    return sum(
+        1 for char in sentence if unicodedata.category(char)[0] != "P"
+    )
+
 def write_text_sidecar(events_df, sentences, sidecar_path: Path):
     """把每个试次的句子与其 Reading / Inner-speech onset 写成 sidecar TSV。
 
@@ -317,6 +324,7 @@ def write_text_sidecar(events_df, sentences, sidecar_path: Path):
             "reading_onset": reading,
             "inner_onset": inner,
             "sentence": sentences,
+            "n_chars": [count_nonpunct_chars(sentence) for sentence in sentences],
         }
     ).to_csv(sidecar_path, sep="\t", index=False)
 
