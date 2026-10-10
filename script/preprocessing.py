@@ -9,13 +9,13 @@ day 编号与数据的对应关系：
 命令行示例：
 
     # 遍历某个被试的指定 days（每个 day 打印该天的 EDF 文件名）
-    uv run python script/preprocessing1.py --subject sub-01 --days 1 2 3 4 5 6 7 8
+    uv run python script/preprocessing.py --subject sub-01 --days 1 2 3 4 5 6 7 8
 
     # 只处理部分 days
-    uv run python script/preprocessing1.py --subject sub-01 --days 1 5
+    uv run python script/preprocessing.py --subject sub-01 --days 1 5
 
     # 不指定 --subject 时遍历 datasets/ds006317-download 下的全部被试
-    uv run python script/preprocessing1.py --days 1 2 3 4 5 6 7 8
+    uv run python script/preprocessing.py --days 1 2 3 4 5 6 7 8
 """
 
 import argparse
