@@ -21,14 +21,22 @@ train / val 按 **句子** 做 8:2 切分（不是按 trial），保证同一句
 注意句子只在**跨天**之间重复：day-01 里每句只录了一次（无重复）。
 所以想拿到"同句多视图"的正样本，必须一次取多天，例如 ``--day 1 2 3 4``。
 
+采样
+----
+训练用 ``SentenceGroupBatchSampler``：每个 batch 抽 ``n_sentences`` 个不同句子，
+每句再抽 ``n_repeats`` 条 trial，于是同句的多视图**必然同框**，``pos/anch`` 恒等于
+``n_repeats``。若改用随机 shuffle，多视图撞进同一 batch 的概率极低
+（实测 day-01~04 时 pos/anch 只有 1.03），多正样本机制等于空转。
+``--n-repeats 1`` 可退化成随机 shuffle 的效果，用作对照。
+
 文本侧用冻结的 LaBSE，所有句子的文本 embedding 在训练前一次性算好、做成查表，
 训练时只做索引，不重复跑 LaBSE。
 
 用法::
 
     uv run python char_token/train.py
-    uv run python char_token/train.py --day 1 2 3 4 --epochs 50
-    uv run python char_token/train.py --temperature 0.1 --batch-size 64 --lr 5e-4
+    uv run python char_token/train.py --day 1 2 3 4 --n-sentences 8 --n-repeats 4
+    uv run python char_token/train.py --day 1 2 3 4 --temperature 0.1 --lr 5e-4
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ import argparse
 import csv
 import random
 import sys
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +58,7 @@ if __package__ in (None, ""):
 
 from char_token.dataset import CharTokenEEGDataset, char_token_collate
 from char_token.model import CharTokenEEGEncoder
+from char_token.sampler import SentenceGroupBatchSampler
 from char_token.text_encoder import LaBSETextEncoder
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -229,7 +239,15 @@ def parse_args():
     parser.add_argument("--sample", type=int, default=250, help="采样率 Hz（默认 250）")
     parser.add_argument("--char-duration", type=float, default=0.4, help="每个字 token 的时长（秒，默认 0.4）")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="验证集句子比例（默认 0.2）")
-    parser.add_argument("--batch-size", type=int, default=32, help="batch 大小（默认 32）")
+    parser.add_argument(
+        "--n-sentences", type=int, default=8,
+        help="每个训练 batch 里不同句子的数量（默认 8）",
+    )
+    parser.add_argument(
+        "--n-repeats", type=int, default=4,
+        help="每个句子在每个 batch 里抽多少条 trial 当正样本（默认 4）",
+    )
+    parser.add_argument("--batch-size", type=int, default=32, help="验证集 DataLoader 的 batch 大小（默认 32）")
     parser.add_argument("--epochs", type=int, default=30, help="训练轮数（默认 30）")
     parser.add_argument("--lr", type=float, default=1e-3, help="AdamW 学习率（默认 1e-3）")
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW 权重衰减（默认 1e-4）")
@@ -248,7 +266,8 @@ def main():
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
-    print(f"[Config] device={device} temperature={args.temperature} batch={args.batch_size} "
+    print(f"[Config] device={device} temperature={args.temperature} "
+          f"batch={args.n_sentences}句×{args.n_repeats}视图 "
           f"epochs={args.epochs} lr={args.lr} seed={args.seed}")
 
     # ---------------- 数据 ----------------
@@ -271,13 +290,51 @@ def main():
         f"(trial {len(train_set)} / {len(val_set)})，句子重叠={info['sentence_overlap']}"
     )
 
-    loader_kwargs = dict(
-        batch_size=args.batch_size,
+    # ---------------- 分组 batch sampler ----------------
+    # 一句最多能提供多少条 trial：单天是 1（无重复），跨天才有多个视图
+    all_sentences = dataset.meta["sentence"].tolist()
+    train_sentences = [all_sentences[i] for i in train_set.indices]
+    max_repeats = max(Counter(train_sentences).values())
+
+    # 把 n_repeats 限到实际可用值，再按用户原本想要的 batch 大小回推 n_sentences
+    target_batch = args.n_sentences * args.n_repeats
+    n_repeats = min(args.n_repeats, max_repeats)
+    n_sentences = max(1, target_batch // n_repeats)
+    if n_repeats != args.n_repeats:
+        print(
+            f"[Sampler] 单句最多只有 {max_repeats} 条 trial，n_repeats "
+            f"{args.n_repeats} -> {n_repeats}，n_sentences 相应调整为 {n_sentences} "
+            f"（保持 batch={target_batch}）"
+        )
+
+    train_sampler = SentenceGroupBatchSampler(
+        train_sentences, n_sentences=n_sentences, n_repeats=n_repeats, seed=args.seed
+    )
+    print(
+        f"[Sampler] 每 batch {train_sampler.n_sentences} 句 × "
+        f"{train_sampler.n_repeats} 视图 = {train_sampler.batch_size} 条；"
+        f"可用句子 {len(train_sampler.groups)}/{len(set(train_sentences))}"
+        + (
+            f"（{len(train_sampler.excluded_sentences)} 句因 trial 不足被排除）"
+            if train_sampler.excluded_sentences
+            else ""
+        )
+        + f"；每轮 {len(train_sampler)} 个 batch"
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_sampler=train_sampler,
         collate_fn=char_token_collate,
         num_workers=args.num_workers,
     )
-    train_loader = DataLoader(train_set, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_set, shuffle=False, **loader_kwargs)
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=char_token_collate,
+        num_workers=args.num_workers,
+    )
 
     # ---------------- 文本 embedding（冻结，一次性算好） ----------------
     print("[Text] 加载 LaBSE 并预计算全部句子 embedding ...")
