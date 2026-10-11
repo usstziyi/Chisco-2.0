@@ -8,16 +8,18 @@ train / val 按 **句子** 做 8:2 切分（不是按 trial），保证同一句
 
 损失
 ----
-对称 InfoNCE（对比学习交叉熵），正样本是"EEG 与它自己的文本"：
+多正样本对称 InfoNCE（对比学习交叉熵）：
 
     logits = eeg_embedding @ text_embedding.T / temperature
-    loss   = 0.5 * (CE(logits, labels) + CE(logits.T, labels))
+    loss   = 0.5 * (MP-CE(logits) + MP-CE(logits.T))
 
-温度系数默认 0.2。
+温度系数默认 0.2。正样本由"句子"决定：同一句的所有 trial 互为正样本。
+一批里每句只出现一次时（单天数据），正样本矩阵退化成单位阵，损失就是
+标准的单正样本 CLIP 式 InfoNCE；一批里同一句出现多次时（多天数据），
+同句的 trial 互为正样本，不会被当成负样本互相推开（假负样本）。
 
-注意 day-01 里每句话只录了一次（无重复），所以 batch 内不存在"同句的第二个
-trial"当正样本，正样本只能是配对的那条文本，负样本是 batch 内其它句子的文本，
-即 CLIP 式的 in-batch negatives。句子只重复出现在跨天之间。
+注意句子只在**跨天**之间重复：day-01 里每句只录了一次（无重复）。
+所以想拿到"同句多视图"的正样本，必须一次取多天，例如 ``--day 1 2 3 4``。
 
 文本侧用冻结的 LaBSE，所有句子的文本 embedding 在训练前一次性算好、做成查表，
 训练时只做索引，不重复跑 LaBSE。
@@ -25,7 +27,7 @@ trial"当正样本，正样本只能是配对的那条文本，负样本是 batc
 用法::
 
     uv run python char_token/train.py
-    uv run python char_token/train.py --event inner --epochs 50
+    uv run python char_token/train.py --day 1 2 3 4 --epochs 50
     uv run python char_token/train.py --temperature 0.1 --batch-size 64 --lr 5e-4
 """
 
@@ -39,7 +41,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 # 支持 `python char_token/train.py` 直接执行（此时 sys.path 不含项目根目录）
@@ -105,41 +106,85 @@ def gather_text(sentences, lookup, device) -> torch.Tensor:
     return torch.stack([lookup[s] for s in sentences]).to(device)
 
 
-def contrastive_loss(eeg: torch.Tensor, text: torch.Tensor, temperature: float) -> torch.Tensor:
-    """对称 InfoNCE：EEG->文本 与 文本->EEG 两个方向取平均。"""
+def sentence_group_ids(sentences, device) -> torch.Tensor:
+    """把句子列表映射成组 id：同句的 trial 得到同一个 id。
+
+    多天训练时同一句会在一批里出现多次，它们互为对方的正样本。
+    """
+    mapping: dict[str, int] = {}
+    ids = []
+    for sentence in sentences:
+        if sentence not in mapping:
+            mapping[sentence] = len(mapping)
+        ids.append(mapping[sentence])
+    return torch.tensor(ids, dtype=torch.long, device=device)
+
+
+def _multi_positive_ce(logits: torch.Tensor, positive: torch.Tensor) -> torch.Tensor:
+    """多正样本交叉熵：每个 anchor 对"所有正样本列"求平均的 -log softmax。
+
+    positive 为 (B, B) 的 0/1 掩码，第 i 行的正样本列就是 anchor i 该拉近的候选。
+    每行至少有一个正样本（含 anchor 自己），所以分母不会为 0。
+    """
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    return -(log_prob * positive).sum(dim=1).div(positive.sum(dim=1)).mean()
+
+
+def contrastive_loss(
+    eeg: torch.Tensor,
+    text: torch.Tensor,
+    temperature: float,
+    groups: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """多正样本对称 InfoNCE：EEG->文本 与 文本->EEG 两个方向取平均。
+
+    正样本由 ``groups`` 决定：只要两句的 group id 相同，就互为正样本。
+
+    - 一批里每句只出现一次时（例如单天数据），``groups`` 两两不同，
+      正样本矩阵退化成单位阵，损失与"对角线单正样本"的 CLIP 式写法完全一致；
+    - 一批里同一句出现多次时（多天数据），同句的所有 trial 互为正样本，
+      不会像单正样本写法那样把它们当成负样本互相推开。
+    """
     logits = eeg @ text.t() / temperature
-    labels = torch.arange(logits.size(0), device=logits.device)
-    loss_e2t = F.cross_entropy(logits, labels)
-    loss_t2e = F.cross_entropy(logits.t(), labels)
-    return 0.5 * (loss_e2t + loss_t2e)
+    if groups is None:
+        groups = torch.arange(logits.size(0), device=logits.device)
+    positive = (groups[:, None] == groups[None, :]).to(logits.dtype)
+    # positive 是对称的，两个方向共用同一套正样本掩码
+    return 0.5 * (
+        _multi_positive_ce(logits, positive) + _multi_positive_ce(logits.t(), positive)
+    )
 
 
-def train_one_epoch(model, loader, lookup, optimizer, device, temperature) -> float:
+def train_one_epoch(model, loader, lookup, optimizer, device, temperature):
+    """跑一个 epoch，返回 ``(平均 loss, 每个 anchor 的平均正样本数)``。"""
     model.train()
-    total_loss, total_n = 0.0, 0
+    total_loss, total_n, total_pos = 0.0, 0, 0.0
     for tokens, mask, sentences in loader:
         tokens = tokens.to(device)
         mask = mask.to(device)
         text = gather_text(sentences, lookup, device)
+        groups = sentence_group_ids(sentences, device)
 
         eeg = model(tokens, mask)
-        loss = contrastive_loss(eeg, text, temperature)
+        loss = contrastive_loss(eeg, text, temperature, groups)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * len(sentences)
-        total_n += len(sentences)
-    return total_loss / max(total_n, 1)
+        batch = len(sentences)
+        total_loss += loss.item() * batch
+        total_n += batch
+        total_pos += (groups[:, None] == groups[None, :]).sum().item()
+    return total_loss / max(total_n, 1), total_pos / max(total_n, 1)
 
 
 @torch.no_grad()
 def evaluate(model, loader, lookup, device, temperature) -> dict:
     """在整个 val 集上算检索指标与全库对比损失。
 
-    因为切分保证 val 内每句互不相同，对角线就是唯一正样本，
-    所以 ``sim.argmax(1) == 自身下标`` 即可判定 top-1 命中。
+    命中判定是"分组感知"的：只要 top-k 里出现**任意一个同句**的候选就算命中。
+    单天数据下每句只有一个 trial，分组掩码退化成单位阵，结果与"对角线命中"一致。
     """
     model.eval()
     eeg_parts, sentences = [], []
@@ -149,17 +194,22 @@ def evaluate(model, loader, lookup, device, temperature) -> dict:
 
     eeg = torch.cat(eeg_parts, dim=0)
     text = gather_text(sentences, lookup, device)
+    groups = sentence_group_ids(sentences, device)
     n = eeg.size(0)
-    labels = torch.arange(n, device=device)
+    positive = groups[:, None] == groups[None, :]
     sim = eeg @ text.t()
+    row = torch.arange(n, device=device)[:, None]
 
     metrics = {
-        "val_loss": float(contrastive_loss(eeg, text, temperature)),
+        "val_loss": float(contrastive_loss(eeg, text, temperature, groups)),
         "n_val": n,
         "n_unique_sentences": len(set(sentences)),
+        "pos_per_anchor": float(positive.sum(dim=1).float().mean()),
     }
     for name, matrix in (("eeg2text", sim), ("text2eeg", sim.t())):
-        hit = matrix.argsort(dim=1, descending=True).eq(labels[:, None])
+        # 按相似度降序排出候选，再用正样本掩码判断每个名次是否命中
+        ranked = matrix.argsort(dim=1, descending=True)
+        hit = positive[row, ranked]
         metrics[f"{name}_top1"] = float(hit[:, :1].any(dim=1).float().mean())
         metrics[f"{name}_top5"] = float(hit[:, :5].any(dim=1).float().mean())
     return metrics
@@ -168,7 +218,10 @@ def evaluate(model, loader, lookup, device, temperature) -> dict:
 def parse_args():
     parser = argparse.ArgumentParser(description="字符级 token EEG–文本对比学习训练。")
     parser.add_argument("--subject", default="sub-01", help="被试，如 sub-01")
-    parser.add_argument("--day", type=int, default=1, help="day 编号（1~8），默认 1")
+    parser.add_argument(
+        "--day", type=int, nargs="+", default=[1],
+        help="day 编号（1~8），可传多个，如 --day 1 2 3 4；默认 1",
+    )
     parser.add_argument(
         "--event", default="inner", choices=["inner", "reading"],
         help="取 inner（默读，默认）或 reading（朗读）",
@@ -209,8 +262,9 @@ def main():
     dataset[0]  # 触发一次读取，确定 n_chans
     train_set, val_set, info = split_by_sentence(dataset, args.val_ratio, args.seed)
 
+    days_label = ",".join(f"{d:02d}" for d in sorted(args.day))
     print(
-        f"[Data] {args.subject} day-{args.day:02d} event={args.event} "
+        f"[Data] {args.subject} day-{days_label} event={args.event} "
         f"token_samples={dataset.token_samples} n_chans={dataset.n_chans}\n"
         f"       句子 {len(dataset.meta['sentence'].unique())} 条 -> "
         f"train {info['n_unique_train']} / val {info['n_unique_val']} "
@@ -259,14 +313,14 @@ def main():
     best_top1 = -1.0
     rows = []
     header = (
-        f"{'epoch':>5} {'train_loss':>10} {'val_loss':>9} "
+        f"{'epoch':>5} {'train_loss':>10} {'pos/anch':>9} {'val_loss':>9} "
         f"{'e2t@1':>7} {'e2t@5':>7} {'t2e@1':>7} {'t2e@5':>7}"
     )
     print(f"\n{header}")
     print("-" * len(header))
 
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(
+        train_loss, train_pos = train_one_epoch(
             model, train_loader, lookup, optimizer, device, args.temperature
         )
         metrics = evaluate(model, val_loader, lookup, device, args.temperature)
@@ -274,7 +328,8 @@ def main():
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
-            **{k: v for k, v in metrics.items()},
+            "train_pos_per_anchor": train_pos,
+            **metrics,
             "lr": args.lr,
             "temperature": args.temperature,
         }
@@ -298,7 +353,7 @@ def main():
             )
 
         print(
-            f"{epoch:>5} {train_loss:>10.4f} {metrics['val_loss']:>9.4f} "
+            f"{epoch:>5} {train_loss:>10.4f} {train_pos:>9.2f} {metrics['val_loss']:>9.4f} "
             f"{metrics['eeg2text_top1']:>7.4f} {metrics['eeg2text_top5']:>7.4f} "
             f"{metrics['text2eeg_top1']:>7.4f} {metrics['text2eeg_top5']:>7.4f}{flag}"
         )
@@ -308,11 +363,14 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    chance1 = 1.0 / metrics["n_val"]
-    chance5 = min(5, metrics["n_val"]) / metrics["n_val"]
+    # 多正样本下随机基线随"每个 anchor 有几个同句候选"上升
+    n_val, pos_per_anchor = metrics["n_val"], metrics["pos_per_anchor"]
+    chance1 = min(pos_per_anchor / n_val, 1.0)
+    chance5 = min(5 * pos_per_anchor / n_val, 1.0)
     print(
         f"\n[Done] 最佳 eeg2text top-1 = {best_top1:.4f}（随机基线 {chance1:.4f}）\n"
-        f"       随机 top-5 基线 = {chance5:.4f}，val 共 {metrics['n_val']} 句\n"
+        f"       随机 top-5 基线 = {chance5:.4f}，val 共 {n_val} 条 / "
+        f"{metrics['n_unique_sentences']} 句，每个 anchor 平均 {pos_per_anchor:.2f} 个同句候选\n"
         f"       checkpoint: {ckpt_path}\n"
         f"       metrics:    {log_path}"
     )
