@@ -29,14 +29,26 @@ train / val 按 **句子** 做 8:2 切分（不是按 trial），保证同一句
 （实测 day-01~04 时 pos/anch 只有 1.03），多正样本机制等于空转。
 ``--n-repeats 1`` 可退化成随机 shuffle 的效果，用作对照。
 
+评测
+----
+两个检索方向的候选池不同：
+
+- ``eeg2text``：候选 = **去重后的唯一句子**。同句的多个 trial 共享同一个文本向量，
+  不去重的话同一句会占掉 4 个连续名次，``top-5`` 实际只等于 top-2。
+- ``text2eeg``：候选 = 全部 EEG 样本（互不相同），命中 = 前 k 名里出现任意同句。
+
+``val_loss`` 越小越好，其余指标越大越好；best checkpoint 默认按 ``val_loss`` 选
+（``eeg2text_top1`` 在 900 条 val 上噪声很大，单条翻转就是 0.11%）。
+
 文本侧用冻结的 LaBSE，所有句子的文本 embedding 在训练前一次性算好、做成查表，
 训练时只做索引，不重复跑 LaBSE。
 
 用法::
 
     uv run python char_token/train.py
-    uv run python char_token/train.py --day 1 2 3 4 --n-sentences 8 --n-repeats 4
-    uv run python char_token/train.py --day 1 2 3 4 --temperature 0.1 --lr 5e-4
+    uv run python char_token/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4
+    uv run python char_token/train.py --day 1 2 3 4 --lr-schedule none --weight-decay 0
+    uv run python char_token/train.py --select-by eeg2text_top5
 """
 
 from __future__ import annotations
@@ -193,8 +205,13 @@ def train_one_epoch(model, loader, lookup, optimizer, device, temperature):
 def evaluate(model, loader, lookup, device, temperature) -> dict:
     """在整个 val 集上算检索指标与全库对比损失。
 
-    命中判定是"分组感知"的：只要 top-k 里出现**任意一个同句**的候选就算命中。
-    单天数据下每句只有一个 trial，分组掩码退化成单位阵，结果与"对角线命中"一致。
+    两个方向的候选池不同，这是有意为之：
+
+    - **eeg->text**：候选池 = **去重后的唯一句子**。同句的多个 trial 共享同一个
+      文本向量，若不去重，同一句的 4 个副本会在排名里占掉 4 个连续位置，
+      ``top-5`` 实际只等于"正确答案排在前 2 个不同句子里"。
+    - **text->eeg**：候选池 = 全部 EEG 样本（彼此互不相同），命中判定为
+      "前 k 名里出现任意一个同句候选"。
     """
     model.eval()
     eeg_parts, sentences = [], []
@@ -207,8 +224,6 @@ def evaluate(model, loader, lookup, device, temperature) -> dict:
     groups = sentence_group_ids(sentences, device)
     n = eeg.size(0)
     positive = groups[:, None] == groups[None, :]
-    sim = eeg @ text.t()
-    row = torch.arange(n, device=device)[:, None]
 
     metrics = {
         "val_loss": float(contrastive_loss(eeg, text, temperature, groups)),
@@ -216,12 +231,26 @@ def evaluate(model, loader, lookup, device, temperature) -> dict:
         "n_unique_sentences": len(set(sentences)),
         "pos_per_anchor": float(positive.sum(dim=1).float().mean()),
     }
-    for name, matrix in (("eeg2text", sim), ("text2eeg", sim.t())):
-        # 按相似度降序排出候选，再用正样本掩码判断每个名次是否命中
-        ranked = matrix.argsort(dim=1, descending=True)
-        hit = positive[row, ranked]
-        metrics[f"{name}_top1"] = float(hit[:, :1].any(dim=1).float().mean())
-        metrics[f"{name}_top5"] = float(hit[:, :5].any(dim=1).float().mean())
+
+    # ---- eeg -> text：候选池去重成唯一句子，每个 anchor 恰好 1 个正样本 ----
+    unique_sentences = sorted(set(sentences))
+    sentence_to_col = {s: i for i, s in enumerate(unique_sentences)}
+    text_unique = gather_text(unique_sentences, lookup, device)
+    target = torch.tensor(
+        [sentence_to_col[s] for s in sentences], device=device, dtype=torch.long
+    )
+    ranked = (eeg @ text_unique.t()).argsort(dim=1, descending=True)
+    hit = ranked.eq(target[:, None])
+    metrics["n_text_candidates"] = len(unique_sentences)
+    metrics["eeg2text_top1"] = float(hit[:, :1].any(dim=1).float().mean())
+    metrics["eeg2text_top5"] = float(hit[:, :5].any(dim=1).float().mean())
+
+    # ---- text -> eeg：候选池是全部 EEG 样本，命中 = 前 k 名里出现任意同句 ----
+    ranked = (text @ eeg.t()).argsort(dim=1, descending=True)
+    hit = positive[torch.arange(n, device=device)[:, None], ranked]
+    metrics["text2eeg_top1"] = float(hit[:, :1].any(dim=1).float().mean())
+    metrics["text2eeg_top5"] = float(hit[:, :5].any(dim=1).float().mean())
+
     return metrics
 
 
@@ -250,7 +279,16 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=32, help="验证集 DataLoader 的 batch 大小（默认 32）")
     parser.add_argument("--epochs", type=int, default=30, help="训练轮数（默认 30）")
     parser.add_argument("--lr", type=float, default=1e-3, help="AdamW 学习率（默认 1e-3）")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW 权重衰减（默认 1e-4）")
+    parser.add_argument("--weight-decay", type=float, default=1e-3, help="AdamW 权重衰减（默认 1e-3）")
+    parser.add_argument(
+        "--lr-schedule", default="cosine", choices=["none", "cosine"],
+        help="学习率调度：cosine 按 epoch 余弦衰减到 0（默认），none 恒定",
+    )
+    parser.add_argument(
+        "--select-by", default="val_loss",
+        choices=["val_loss", "eeg2text_top1", "eeg2text_top5", "text2eeg_top5"],
+        help="用哪个指标选 best checkpoint（默认 val_loss，越小越好；其余越大越好）",
+    )
     parser.add_argument("--temperature", type=float, default=0.2, help="对比学习温度系数（默认 0.2）")
     parser.add_argument("--seed", type=int, default=0, help="随机种子（默认 0）")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker 数（默认 0）")
@@ -268,7 +306,8 @@ def main():
     )
     print(f"[Config] device={device} temperature={args.temperature} "
           f"batch={args.n_sentences}句×{args.n_repeats}视图 "
-          f"epochs={args.epochs} lr={args.lr} seed={args.seed}")
+          f"epochs={args.epochs} lr={args.lr} wd={args.weight_decay} "
+          f"schedule={args.lr_schedule} select={args.select_by} seed={args.seed}")
 
     # ---------------- 数据 ----------------
     dataset = CharTokenEEGDataset(
@@ -360,6 +399,12 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
+    # 恒定学习率在 val_loss 走平后仍会继续拟合，余弦衰减到 0 有助于收敛
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        if args.lr_schedule == "cosine"
+        else None
+    )
 
     # ---------------- 训练 ----------------
     out_dir = Path(args.out_dir)
@@ -367,19 +412,23 @@ def main():
     ckpt_path = out_dir / "best.pt"
     log_path = out_dir / "metrics.csv"
 
-    best_top1 = -1.0
+    lower_is_better = args.select_by == "val_loss"
+    best_score = float("inf") if lower_is_better else -float("inf")
     rows = []
     header = (
-        f"{'epoch':>5} {'train_loss':>10} {'pos/anch':>9} {'val_loss':>9} "
+        f"{'epoch':>5} {'lr':>8} {'train_loss':>10} {'pos/anch':>9} {'val_loss':>9} "
         f"{'e2t@1':>7} {'e2t@5':>7} {'t2e@1':>7} {'t2e@5':>7}"
     )
-    print(f"\n{header}")
+    print(f"\n{header}  (best by {args.select_by})")
     print("-" * len(header))
 
     for epoch in range(1, args.epochs + 1):
+        epoch_lr = optimizer.param_groups[0]["lr"]
         train_loss, train_pos = train_one_epoch(
             model, train_loader, lookup, optimizer, device, args.temperature
         )
+        if scheduler is not None:
+            scheduler.step()
         metrics = evaluate(model, val_loader, lookup, device, args.temperature)
 
         row = {
@@ -387,14 +436,16 @@ def main():
             "train_loss": train_loss,
             "train_pos_per_anchor": train_pos,
             **metrics,
-            "lr": args.lr,
+            "lr": epoch_lr,
             "temperature": args.temperature,
         }
         rows.append(row)
 
+        score = metrics[args.select_by]
+        improved = score < best_score if lower_is_better else score > best_score
         flag = ""
-        if metrics["eeg2text_top1"] > best_top1:
-            best_top1 = metrics["eeg2text_top1"]
+        if improved:
+            best_score = score
             flag = " *"
             torch.save(
                 {
@@ -410,7 +461,8 @@ def main():
             )
 
         print(
-            f"{epoch:>5} {train_loss:>10.4f} {train_pos:>9.2f} {metrics['val_loss']:>9.4f} "
+            f"{epoch:>5} {epoch_lr:>8.2e} {train_loss:>10.4f} {train_pos:>9.2f} "
+            f"{metrics['val_loss']:>9.4f} "
             f"{metrics['eeg2text_top1']:>7.4f} {metrics['eeg2text_top5']:>7.4f} "
             f"{metrics['text2eeg_top1']:>7.4f} {metrics['text2eeg_top5']:>7.4f}{flag}"
         )
@@ -420,14 +472,17 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    # 多正样本下随机基线随"每个 anchor 有几个同句候选"上升
-    n_val, pos_per_anchor = metrics["n_val"], metrics["pos_per_anchor"]
-    chance1 = min(pos_per_anchor / n_val, 1.0)
-    chance5 = min(5 * pos_per_anchor / n_val, 1.0)
+    # 两个方向的候选池不同，随机基线也要分别算
+    n_val = metrics["n_val"]
+    n_cand = metrics["n_text_candidates"]
+    pos_per_anchor = metrics["pos_per_anchor"]
     print(
-        f"\n[Done] 最佳 eeg2text top-1 = {best_top1:.4f}（随机基线 {chance1:.4f}）\n"
-        f"       随机 top-5 基线 = {chance5:.4f}，val 共 {n_val} 条 / "
-        f"{metrics['n_unique_sentences']} 句，每个 anchor 平均 {pos_per_anchor:.2f} 个同句候选\n"
+        f"\n[Done] best {args.select_by} = {best_score:.4f}\n"
+        f"       eeg2text 候选 {n_cand} 句，随机基线 top-1={1 / n_cand:.4f} "
+        f"top-5={min(5, n_cand) / n_cand:.4f}\n"
+        f"       text2eeg 候选 {n_val} 条（每 anchor {pos_per_anchor:.2f} 个同句），"
+        f"随机基线 top-1={min(pos_per_anchor / n_val, 1.0):.4f} "
+        f"top-5={min(5 * pos_per_anchor / n_val, 1.0):.4f}\n"
         f"       checkpoint: {ckpt_path}\n"
         f"       metrics:    {log_path}"
     )
