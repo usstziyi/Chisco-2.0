@@ -25,7 +25,7 @@ trial"当正样本，正样本只能是配对的那条文本，负样本是 batc
 用法::
 
     uv run python char_token/train.py
-    uv run python char_token/train.py --event reading --epochs 50
+    uv run python char_token/train.py --event inner --epochs 50
     uv run python char_token/train.py --temperature 0.1 --batch-size 64 --lr 5e-4
 """
 
