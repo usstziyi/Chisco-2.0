@@ -11,3 +11,5 @@ wheels/
 
 ds006317-download/
 preprocessed/
+
+*.pt
