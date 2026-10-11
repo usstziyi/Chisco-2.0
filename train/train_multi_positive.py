@@ -308,9 +308,9 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int, default=0, help="每轮最多跑多少个 batch（0 表示不限制，用于冒烟测试）")
     # TSConv 结构超参
     parser.add_argument("--k", type=int, default=40, help="TSConv 时间卷积输出通道数")
-    parser.add_argument("--m1", type=int, default=50, help="时间卷积核长度")
-    parser.add_argument("--m2", type=int, default=100, help="时间平均池化窗口")
-    parser.add_argument("--s", type=int, default=20, help="时间平均池化 stride")
+    parser.add_argument("--m1", type=int, default=25, help="时间卷积核长度")
+    parser.add_argument("--m2", type=int, default=51, help="时间平均池化窗口")
+    parser.add_argument("--s", type=int, default=5, help="时间平均池化 stride")
     parser.add_argument("--projection-hidden-dim", type=int, default=512, help="投影 MLP 隐藏层维度")
     parser.add_argument("--drop-prob", type=float, default=0.5, help="TSConv dropout")
     args = parser.parse_args()
