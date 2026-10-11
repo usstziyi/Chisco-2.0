@@ -1,0 +1,2 @@
+n_chars,event,sample,subject,run_id,device,n_chans,n_times,epochs,best_epoch,best_val_loss,best_val_top1,best_val_topk,best_val_k,best_val_cos_pos,last_val_loss,last_val_top1,last_val_topk,last_val_cos_pos,checkpoint
+9,inner,250,sub-01,20261011-141410,cpu,122,1000,10,6,4.102008,0.020000,0.080000,5,0.019821,4.266083,0.020000,0.080000,0.025296,best.pt

@@ -1,0 +1,2 @@
+epoch,train_loss,train_top1,val_loss,val_top1,val_topk,val_k,val_cos_pos,is_best,best_top1,seconds
+1,3.500802,0.035971,3.354344,0.020000,0.050000,5,0.011087,1,0.020000,53.350
