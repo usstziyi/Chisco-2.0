@@ -106,7 +106,7 @@ def build_nchars9_dataloaders(
 
 
 if __name__ == "__main__":
-    train_loader, val_loader = build_nchars9_dataloaders(batch_size=32, event="inner", seed=0)
+    train_loader, val_loader = build_nchars9_dataloaders(batch_size=32, event="inner", subject="sub-01", seed=0)
     ds = train_loader.dataset.dataset  # Subset -> ChiscoEEGTextDataset
 
     print(
