@@ -10,12 +10,13 @@
 的成绩来自真实脑电；若仍显著更高，则说明模型在利用与信号无关的旁路信息（例如 token
 个数 = 句子长度），需要回头检查 ``char_token`` 的设计。
 
-用法::
+用法:
 
     uv run python char_token_noise/train.py
     uv run python char_token_noise/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4
     uv run python char_token_noise/train.py --noise-mode uniform --noise-std 0.5
     uv run python char_token_noise/train.py --noise-refresh never   # 固定噪声，完全可复现
+    uv run python char_token_noise/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4 --epochs 20 --seed 0 --noise-mode gaussian --noise-std 1.0 --noise-seed 0 --noise-refresh epoch
 """
 
 from __future__ import annotations

@@ -49,6 +49,7 @@ train / val 按 **句子** 做 8:2 切分（不是按 trial），保证同一句
     uv run python char_token/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4
     uv run python char_token/train.py --day 1 2 3 4 --lr-schedule none --weight-decay 0
     uv run python char_token/train.py --select-by eeg2text_top5
+    uv run python char_token/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4 --epochs 20 --seed 0
 """
 
 from __future__ import annotations
