@@ -14,6 +14,3 @@ preprocessed/
 
 outputs/
 *.pt
-
-pyproject.toml
-uv.lock
