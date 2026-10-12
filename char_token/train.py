@@ -58,6 +58,7 @@ import csv
 import random
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -120,7 +121,8 @@ def build_text_lookup(encoder, sentences, device, chunk: int = 64):
         for start in range(0, len(unique), chunk):
             vectors.append(encoder(unique[start : start + chunk]))
     table = torch.cat(vectors, dim=0).to(device)
-    return dict(zip(unique, table)), table.shape[1]
+    embedding_dim = table.shape[1]
+    return dict(zip(unique, table)), embedding_dim
 
 
 def gather_text(sentences, lookup, device) -> torch.Tensor:
@@ -182,9 +184,9 @@ def train_one_epoch(model, loader, lookup, optimizer, device, temperature):
     model.train()
     total_loss, total_n, total_pos = 0.0, 0, 0.0
     for tokens, mask, sentences in loader:
-        tokens = tokens.to(device)
-        mask = mask.to(device)
-        text = gather_text(sentences, lookup, device)
+        tokens = tokens.to(device) # (B,n,C,T)
+        mask = mask.to(device) # (B,n)
+        text = gather_text(sentences, lookup, device) # (B,D)
         groups = sentence_group_ids(sentences, device)
 
         eeg = model(tokens, mask)
@@ -238,12 +240,12 @@ def evaluate(model, loader, lookup, device, temperature) -> dict:
     text_unique = gather_text(unique_sentences, lookup, device)
     target = torch.tensor(
         [sentence_to_col[s] for s in sentences], device=device, dtype=torch.long
-    )
+    ) # 每条 trial 的正确答案列号
     ranked = (eeg @ text_unique.t()).argsort(dim=1, descending=True)
     hit = ranked.eq(target[:, None])
     metrics["n_text_candidates"] = len(unique_sentences)
-    metrics["eeg2text_top1"] = float(hit[:, :1].any(dim=1).float().mean())
-    metrics["eeg2text_top5"] = float(hit[:, :5].any(dim=1).float().mean())
+    metrics["eeg2text_top1"] = float(hit[:, :1].any(dim=1).float().mean()) # 第一名命中 → top-1
+    metrics["eeg2text_top5"] = float(hit[:, :5].any(dim=1).float().mean()) # 前五名里出现过正确答案 → top-5
 
     # ---- text -> eeg：候选池是全部 EEG 样本，命中 = 前 k 名里出现任意同句 ----
     ranked = (text @ eeg.t()).argsort(dim=1, descending=True)
@@ -308,6 +310,7 @@ def main():
           f"batch={args.n_sentences}句×{args.n_repeats}视图 "
           f"epochs={args.epochs} lr={args.lr} wd={args.weight_decay} "
           f"schedule={args.lr_schedule} select={args.select_by} seed={args.seed}")
+
 
     # ---------------- 数据 ----------------
     dataset = CharTokenEEGDataset(
@@ -407,7 +410,8 @@ def main():
     )
 
     # ---------------- 训练 ----------------
-    out_dir = Path(args.out_dir)
+    # 每次运行放入独立的时间戳子目录，便于区分不同次训练
+    out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / "best.pt"
     log_path = out_dir / "metrics.csv"
