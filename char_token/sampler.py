@@ -86,18 +86,17 @@ class SentenceGroupBatchSampler(Sampler[list[int]]):
             )
 
         groups: dict[str, list[int]] = defaultdict(list)
+        # 遍历每个样本，按句子分组收集对应的索引
         for index, sentence in enumerate(sentences):
             groups[str(sentence)].append(index)
 
         # 只有 trial 数 >= n_repeats 的句子才能提供完整的重复组
         self.groups = {
-            sentence: indices
-            for sentence, indices in groups.items()
+            sentence: indices for sentence, indices in groups.items()
             if len(indices) >= n_repeats
         }
         self.excluded_sentences = {
-            sentence: len(indices)
-            for sentence, indices in groups.items()
+            sentence: len(indices) for sentence, indices in groups.items()
             if len(indices) < n_repeats
         }
         if len(self.groups) < n_sentences:
@@ -119,6 +118,8 @@ class SentenceGroupBatchSampler(Sampler[list[int]]):
         self.epoch = int(epoch)
 
     def __len__(self) -> int:
+        """整个 sampler 的调度单位是 group（一个唯一句子） ，不是单条 trial。"""
+        """`__len__` 统计的是 一个 epoch 会产出多少个 batch ，也就是`DataLoader` 一轮迭代的次数。"""
         n_groups = len(self.groups)
         if self.drop_last:
             return n_groups // self.n_sentences
@@ -128,6 +129,7 @@ class SentenceGroupBatchSampler(Sampler[list[int]]):
         rng = random.Random(None if self.seed is None else self.seed + self.epoch)
         self.epoch += 1
 
+        # 把self.groups 的 键取出来、拷成一个新列表，得到这一轮要排队的"句子池"。
         pool = list(self.groups)
         if self.shuffle:
             rng.shuffle(pool)
@@ -152,24 +154,27 @@ if __name__ == "__main__":
 
     from char_token.dataset import CharTokenEEGDataset
 
-    for days, n_repeats in (([1], 1), ([1, 2, 3, 4], 4)):
-        dataset = CharTokenEEGDataset(
-            event="inner", sample=250, subject="sub-01", days=days
-        )
-        sentences = dataset.meta["sentence"].tolist()
-        repeats = Counter(sentences)
 
-        sampler = SentenceGroupBatchSampler(
-            sentences, n_sentences=8, n_repeats=n_repeats, seed=0
-        )
-        batch = next(iter(sampler))
-        counts = Counter(sentences[i] for i in batch)
+    all_dataset = CharTokenEEGDataset(
+        event="inner", sample=250, subject="sub-01", days=[5,6]
+    )
+    print(f"dataset N={len(all_dataset)}")
+    all_sentences = all_dataset.meta["sentence"].tolist()
 
-        print(
-            f"days={days}: {len(sentences)} trial / {len(repeats)} 句，"
-            f"单句 trial 数={sorted(set(repeats.values()))}\n"
-            f"  可用句子 {len(sampler.groups)}，被排除 {len(sampler.excluded_sentences)}，"
-            f"每轮 {len(sampler)} 个 batch，batch_size={sampler.batch_size}\n"
-            f"  首个 batch: {len(batch)} 条，不同句子 {len(counts)} 个，"
-            f"每句重复 {sorted(set(counts.values()))} 次\n"
-        )
+    sampler = SentenceGroupBatchSampler(
+        all_sentences, 
+        n_sentences=8, 
+        n_repeats=4, 
+        seed=0
+    )
+
+    for i,(sentence,indices) in enumerate(sampler.groups.items()):
+        print(i,sentence,indices)   
+        if i >= 5:
+            break
+
+
+    for batch in sampler:
+        for index in batch:
+            print(all_sentences[index])
+        exit(0)
