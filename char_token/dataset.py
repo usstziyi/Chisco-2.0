@@ -109,7 +109,7 @@ class CharTokenEEGDataset(Dataset):
 
     def __init__(
         self,
-        event: str = "reading",
+        event: str = "inner",
         sample: int = 250,
         subject=None,
         days=None,
@@ -138,6 +138,9 @@ class CharTokenEEGDataset(Dataset):
         self.subject = _normalize_subject(subject)
         self.days = _normalize_days(days)
 
+        # 行顺序沿用 all_text.tsv 的物理顺序：该文件由 script/summarize_text.py 按
+        # sample → subject → day → run → trial_index 升序写出；这里只做布尔筛选与
+        # reset_index，不改变相对次序，因此相邻 trial 通常落在同一个 run/FIF 上。
         table = pd.read_csv(text_table, sep="\t")
         mask = table["sample"] == self.sample
         if self.subject is not None:
@@ -262,23 +265,23 @@ def char_token_collate(batch):
 if __name__ == "__main__":
     from torch.utils.data import DataLoader
 
-    for event in ("reading", "inner"):
-        ds = CharTokenEEGDataset(event=event, sample=250)
-        tokens, sentence = ds[0]
-        print(
-            f"event={event:7s} N={len(ds):5d} "
-            f"subjects={sorted(ds.meta['subject'].unique())} "
-            f"token_samples={ds.token_samples} "
-            f"n_tokens 分布={sorted(ds.meta['n_tokens'].unique())}"
-        )
-        print(f"  单样本 tokens={tuple(tokens.shape)} dtype={tokens.dtype} sentence={sentence!r}")
-
-    ds = CharTokenEEGDataset(event="reading", sample=250)
-    loader = DataLoader(ds, batch_size=8, collate_fn=char_token_collate, shuffle=True)
-    tokens, mask, sentences = next(iter(loader))
-    print(
-        f"\nbatch: tokens={tuple(tokens.shape)} mask={tuple(mask.shape)} "
-        f"每行有效 token 数={mask.sum(dim=1).tolist()}"
+    ds = CharTokenEEGDataset(event="inner", days=1, sample=250)
+    loader = DataLoader(
+        ds, batch_size=10, collate_fn=char_token_collate, shuffle=False,
+        drop_last=False,
     )
-    for s in sentences:
-        print(s)
+    print(f"ds N={len(ds)}")
+    print(f"loader N={len(loader)}")
+    # b 是 collate 返回的 (tokens, mask, sentences) 三元组，len(b) 恒为 3；
+    # 样本数看 tokens 的第 0 维
+    batch_size_list = [b[0].shape[0] for b in loader]
+    print(f"最后一个batch的长度是 {batch_size_list[-1]}")
+
+
+    tokens, mask, sentences = next(iter(loader))
+    print(f"tokens.shape={tuple(tokens.shape)}")
+    print(f"mask.shape={tuple(mask.shape)}")
+    print(f"sentences N={len(sentences)}")
+
+    for i,s in enumerate(sentences):
+        print(f"sentences[{i}]={s}")
