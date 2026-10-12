@@ -79,7 +79,9 @@ class LaBSETextEncoder(nn.Module):
         self._embedding_dim = int(actual_dim)
 
         # 文本侧在训练中不更新
-        self.model.eval()  # 固定 Dropout / BatchNorm 行为
+        # 1.固定 Dropout / BatchNorm 行为
+        self.model.eval()
+        # 2.冻结参数
         for param in self.model.parameters():
             param.requires_grad = False
 
