@@ -77,6 +77,30 @@ from char_token.text_encoder import LaBSETextEncoder
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT_DIR = PROJECT_ROOT / "outputs" / "char_token"
 
+# train_epochs.csv 每轮追加一行，字段顺序即表头顺序
+EPOCH_LOG_FIELDS = [
+    "epoch", "lr", "train_loss", "train_pos_per_anchor",
+    "val_loss", "n_val", "n_unique_sentences", "pos_per_anchor",
+    "n_text_candidates",
+    "eeg2text_top1", "eeg2text_top5", "text2eeg_top1", "text2eeg_top5",
+    "is_best", "temperature",
+]
+
+# train_steps.csv 每个训练 step 追加一行：第 0 列 epoch、第 1 列 step
+TRAIN_STEP_FIELDS = [
+    "epoch", "step", "loss", "lr", "pos_per_anchor", "batch_size",
+]
+
+
+def append_csv_row(path: Path, fields: list, row: dict) -> None:
+    """把一行追加到 CSV；文件不存在时先写表头。"""
+    write_header = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -179,11 +203,17 @@ def contrastive_loss(
     )
 
 
-def train_one_epoch(model, loader, lookup, optimizer, device, temperature):
-    """跑一个 epoch，返回 ``(平均 loss, 每个 anchor 的平均正样本数)``。"""
+def train_one_epoch(
+    model, loader, lookup, optimizer, device, temperature, epoch, step_log_path=None
+):
+    """跑一个 epoch，返回 ``(平均 loss, 每个 anchor 的平均正样本数)``。
+
+    传了 ``step_log_path`` 就把每个 step 追加到 CSV：第 0 列 epoch、第 1 列 step。
+    """
     model.train()
     total_loss, total_n, total_pos = 0.0, 0, 0.0
-    for tokens, mask, sentences in loader:
+    lr = optimizer.param_groups[0]["lr"]
+    for step, (tokens, mask, sentences) in enumerate(loader, start=1):
         tokens = tokens.to(device) # (B,n,C,T)
         mask = mask.to(device) # (B,n)
         text = gather_text(sentences, lookup, device) # (B,D)
@@ -197,9 +227,21 @@ def train_one_epoch(model, loader, lookup, optimizer, device, temperature):
         optimizer.step()
 
         batch = len(sentences)
+        pos = (groups[:, None] == groups[None, :]).sum().item()
+
+        if step_log_path is not None:
+            append_csv_row(step_log_path, TRAIN_STEP_FIELDS, {
+                "epoch": epoch,
+                "step": step,
+                "loss": f"{loss.item():.6f}",
+                "lr": f"{lr:.6f}",
+                "pos_per_anchor": f"{pos / batch:.4f}",
+                "batch_size": batch,
+            })
+
         total_loss += loss.item() * batch
         total_n += batch
-        total_pos += (groups[:, None] == groups[None, :]).sum().item()
+        total_pos += pos
     return total_loss / max(total_n, 1), total_pos / max(total_n, 1)
 
 
@@ -414,11 +456,11 @@ def main():
     out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / "best.pt"
-    log_path = out_dir / "metrics.csv"
+    train_epochs_path = out_dir / "train_epochs.csv"
+    train_steps_path = out_dir / "train_steps.csv"
 
     lower_is_better = args.select_by == "val_loss"
     best_score = float("inf") if lower_is_better else -float("inf")
-    rows = []
     header = (
         f"{'epoch':>5} {'lr':>8} {'train_loss':>10} {'pos/anch':>9} {'val_loss':>9} "
         f"{'e2t@1':>7} {'e2t@5':>7} {'t2e@1':>7} {'t2e@5':>7}"
@@ -429,21 +471,12 @@ def main():
     for epoch in range(1, args.epochs + 1):
         epoch_lr = optimizer.param_groups[0]["lr"]
         train_loss, train_pos = train_one_epoch(
-            model, train_loader, lookup, optimizer, device, args.temperature
+            model, train_loader, lookup, optimizer, device, args.temperature,
+            epoch=epoch, step_log_path=train_steps_path,
         )
         if scheduler is not None:
             scheduler.step()
         metrics = evaluate(model, val_loader, lookup, device, args.temperature)
-
-        row = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "train_pos_per_anchor": train_pos,
-            **metrics,
-            "lr": epoch_lr,
-            "temperature": args.temperature,
-        }
-        rows.append(row)
 
         score = metrics[args.select_by]
         improved = score < best_score if lower_is_better else score > best_score
@@ -471,10 +504,24 @@ def main():
             f"{metrics['text2eeg_top1']:>7.4f} {metrics['text2eeg_top5']:>7.4f}{flag}"
         )
 
-    with log_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+        # 本轮指标追加到 train_epochs.csv（首轮自动写表头）
+        append_csv_row(train_epochs_path, EPOCH_LOG_FIELDS, {
+            "epoch": epoch,
+            "lr": f"{epoch_lr:.6f}",
+            "train_loss": f"{train_loss:.6f}",
+            "train_pos_per_anchor": f"{train_pos:.6f}",
+            "val_loss": f"{metrics['val_loss']:.6f}",
+            "n_val": metrics["n_val"],
+            "n_unique_sentences": metrics["n_unique_sentences"],
+            "pos_per_anchor": f"{metrics['pos_per_anchor']:.6f}",
+            "n_text_candidates": metrics["n_text_candidates"],
+            "eeg2text_top1": f"{metrics['eeg2text_top1']:.6f}",
+            "eeg2text_top5": f"{metrics['eeg2text_top5']:.6f}",
+            "text2eeg_top1": f"{metrics['text2eeg_top1']:.6f}",
+            "text2eeg_top5": f"{metrics['text2eeg_top5']:.6f}",
+            "is_best": int(improved),
+            "temperature": args.temperature,
+        })
 
     # 两个方向的候选池不同，随机基线也要分别算
     n_val = metrics["n_val"]
@@ -488,7 +535,8 @@ def main():
         f"随机基线 top-1={min(pos_per_anchor / n_val, 1.0):.4f} "
         f"top-5={min(5 * pos_per_anchor / n_val, 1.0):.4f}\n"
         f"       checkpoint: {ckpt_path}\n"
-        f"       metrics:    {log_path}"
+        f"       epochs:     {train_epochs_path}\n"
+        f"       steps:      {train_steps_path}"
     )
 
 
