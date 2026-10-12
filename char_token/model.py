@@ -120,7 +120,7 @@ class CharTokenEncoder(nn.Module):
             )
 
         x = self.tsconv(tokens.unsqueeze(1))  # (N, 1, C, T) -> (N, k, 1, T2)
-        return self.proj(x.flatten(start_dim=1))
+        return self.proj(x.flatten(start_dim=1)) # (B·n, d_model)
 
 
 class CharTokenEEGEncoder(nn.Module):
@@ -197,7 +197,8 @@ class CharTokenEEGEncoder(nn.Module):
             layer, num_layers=n_layers, enable_nested_tensor=False
         )
 
-        # attention pooling：一个可学习 query 对所有有效 token 做加权汇总
+        # attention pooling：叫注意力池化，一个可学习 query 对所有有效 token 做加权汇总。
+        # 它的唯一目的就是把变长序列池化成一个定长向量。
         self.pool_query = nn.Parameter(torch.zeros(1, 1, d_model))
         self.pool_attn = nn.MultiheadAttention(
             embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True
@@ -207,10 +208,10 @@ class CharTokenEEGEncoder(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
+        # 只有这两个是手工建的 torch.zeros Parameter，必须自己打散；
+        # 其余模块（含 out_proj 的 nn.Linear）交给 PyTorch 默认初始化即可。
         nn.init.trunc_normal_(self.position, std=0.02)
         nn.init.trunc_normal_(self.pool_query, std=0.02)
-        nn.init.xavier_uniform_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -254,8 +255,8 @@ class CharTokenEEGEncoder(nn.Module):
         query = self.pool_query.expand(batch_size, -1, -1)
         pooled, _ = self.pool_attn(
             query, hidden, hidden, key_padding_mask=key_padding_mask
-        )
-        pooled = pooled.squeeze(1)
+        ) # (B, 1, d_model)
+        pooled = pooled.squeeze(1) # (B, d_model)
 
         return F.normalize(self.out_proj(pooled), p=2, dim=-1)
 
