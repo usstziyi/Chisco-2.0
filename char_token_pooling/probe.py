@@ -32,6 +32,7 @@ r"""长度探针：直接检验句嵌入是否线性编码了 token 个数（= �
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -224,8 +225,8 @@ def main():
     rho = _spearman(y_val, pred)
 
     # 零假设对照：打乱 train 标签后重拟合（应读不出任何信息，R²≈0 或为负）
-    gen = torch.Generator().manual_seed(args.seed)
-    ytr_shuf = ytr_c[torch.randperm(ytr_c.numel(), generator=gen, device=device)]
+    gen = torch.Generator(device=ytr_c.device).manual_seed(args.seed)
+    ytr_shuf = ytr_c[torch.randperm(ytr_c.numel(), generator=gen, device=ytr_c.device)]
     w_null = ridge_fit(Xtr_s, ytr_shuf, args.alpha)
     r2_null = r2_score(y_val, Xva_s @ w_null + y_mean)
 
@@ -254,17 +255,18 @@ def main():
     n_tok_val = n_tok[val_set.indices].tolist()
 
     print(f"\n{'=' * 76}\n[分析 2] 按 n_tok 分层的 eeg2text 检索（口径同训练评测）\n{'=' * 76}")
-    print(
-        f"  全 val：top-1={float(hit[:, :1].any(1).float().mean()):.4f}  "
-        f"top-5={float(hit[:, :5].any(1).float().mean()):.4f}"
-    )
+    overall_top1 = float(hit[:, :1].any(1).float().mean())
+    overall_top5 = float(hit[:, :5].any(1).float().mean())
+    print(f"  全 val：top-1={overall_top1:.4f}  top-5={overall_top5:.4f}")
     print(f"  {'n_tok':>6} {'n_trial':>8} {'top1':>8} {'top5':>8}")
+    bucket_rows = []
     for value in sorted(set(n_tok_val)):
         rows = torch.tensor([v == value for v in n_tok_val], device=device)
         n_rows = int(rows.sum())
         top1 = float(hit[rows][:, :1].any(dim=1).float().mean())
         top5 = float(hit[rows][:, :5].any(dim=1).float().mean())
         print(f"  {value:>6d} {n_rows:>8d} {top1:>8.4f} {top5:>8.4f}")
+        bucket_rows.append({"n_tok": value, "n_trial": n_rows, "top1": top1, "top5": top5})
 
     print(
         f"\n  随机基线：top-1={1 / n_cand:.4f}  top-5={min(5, n_cand) / n_cand:.4f}"
@@ -274,6 +276,73 @@ def main():
         "  读法：若模型靠长度取巧，各 n_tok 分桶的性能会随长度明显分档（长/短句更易命中）；"
         "若各桶贴近同一水平，则说明提升来自信号而非长度。"
     )
+
+    # ================= 保存本次运行结果到 checkpoint 所在目录 =================
+    results = {
+        "probe": "length_probe",
+        "ckpt": str(ckpt_path),
+        "config": {
+            "pooling": args.pooling,
+            "input": args.input,
+            "subject": args.subject,
+            "day": sorted(args.day),
+            "event": args.event,
+            "sample": args.sample,
+            "char_duration": args.char_duration,
+            "val_ratio": args.val_ratio,
+            "seed": args.seed,
+            "alpha": args.alpha,
+            "noise_seed": args.noise_seed if args.input == "noise" else None,
+            "device": str(device),
+        },
+        "ckpt_meta": {
+            "train_pooling": ckpt.get("pooling", "attn"),
+            "epoch": ckpt.get("epoch"),
+            "n_chans": ckpt["n_chans"],
+            "token_samples": ckpt["token_samples"],
+            "embedding_dim": ckpt["embedding_dim"],
+        },
+        "data": {
+            "n_train": len(train_set),
+            "n_val": len(val_set),
+            "n_unique_train": info["n_unique_train"],
+            "n_unique_val": info["n_unique_val"],
+            "sentence_overlap": info["sentence_overlap"],
+            "embed_shape": {"train": list(E_train.shape), "val": list(E_val.shape)},
+            "n_tok": {
+                "train": {
+                    "min": float(y_train.min()),
+                    "max": float(y_train.max()),
+                    "mean": float(y_train.mean()),
+                },
+                "val": {
+                    "min": float(y_val.min()),
+                    "max": float(y_val.max()),
+                    "mean": float(y_val.mean()),
+                },
+            },
+        },
+        "length_probe": {
+            "alpha": args.alpha,
+            "val_r2": r2,
+            "val_mae": mae,
+            "val_spearman": rho,
+            "null_r2": r2_null,
+            "trivial_baseline_r2": 0.0,
+            "train_mean_ntok": float(y_mean),
+        },
+        "stratified_retrieval": {
+            "n_candidates": n_cand,
+            "random_top1": 1 / n_cand,
+            "random_top5": min(5, n_cand) / n_cand,
+            "overall_top1": overall_top1,
+            "overall_top5": overall_top5,
+            "by_n_tok": bucket_rows,
+        },
+    }
+    out_path = ckpt_path.parent / f"probe_{args.pooling}_{args.subject}_{args.input}.json"
+    out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n[Probe] 结果已保存 -> {out_path}")
 
 
 if __name__ == "__main__":
