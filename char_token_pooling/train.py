@@ -37,6 +37,7 @@ from char_token.train import (
     TRAIN_STEP_FIELDS,
     append_csv_row,
     build_text_lookup,
+    dump_args_json,
     evaluate,
     set_seed,
     split_by_sentence,
@@ -306,6 +307,7 @@ def main():
     # 同一次运行共用一个时间戳输出目录，各变体的文件以 "{变体}_{被试}" 前缀区分
     out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
+    dump_args_json(args, out_dir)
 
     # ---------------- 逐个池化变体训练 ----------------
     summary = {}

@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import random
 import sys
 from collections import Counter
@@ -103,6 +104,14 @@ def append_csv_row(path: Path, fields: list, row: dict) -> None:
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def dump_args_json(args, out_dir: Path, filename: str = "args.json") -> Path:
+    """把本次运行的所有命令行参数（key/value）以 JSON 写到时间戳输出目录。"""
+    path = Path(out_dir) / filename
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(vars(args), f, ensure_ascii=False, indent=2)
+    return path
 
 
 def set_seed(seed: int) -> None:
@@ -557,6 +566,7 @@ def main():
     # 所有被试共用同一个时间戳目录，文件以被试名前缀区分
     out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
+    dump_args_json(args, out_dir)
 
     # LaBSE 只加载一次，各被试复用同一个文本编码器
     print("[Text] 加载 LaBSE（冻结） ...")

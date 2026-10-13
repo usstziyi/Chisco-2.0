@@ -43,6 +43,7 @@ from char_token.train import (
     TRAIN_STEP_FIELDS,
     append_csv_row,
     build_text_lookup,
+    dump_args_json,
     evaluate,
     set_seed,
     train_one_epoch,
@@ -318,6 +319,7 @@ def main():
 
     out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
+    dump_args_json(args, out_dir)
 
     print("[Text] 加载 LaBSE（冻结） ...")
     text_encoder = LaBSETextEncoder()
