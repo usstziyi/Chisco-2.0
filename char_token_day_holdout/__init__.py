@@ -12,14 +12,18 @@ day-05 ~ day-08（均为 para2）是**同一批 252 句的重复录制**：每�
 **跨天 / 跨 session 泛化**，而不是新句子泛化。这与 ``split_by_sentence`` 刻意保证的
 句子不相交切分是两种不同的评测口径，读结果时务必区分。
 
-    split.py      split_by_day（按 day 切分 train / val）
-    train.py      训练入口
+    split.py       split_by_day（按 day 切分 train / val）
+    train.py       训练入口（单折，指定 --train-days / --val-days）
+    four_fold.py   leave-one-day-out 四折 + 自动汇总 mean±std（复用 train.py）
 
 用法::
 
     uv run python char_token_day_holdout/train.py
     uv run python char_token_day_holdout/train.py --epochs 20 --seed 0
     uv run python char_token_day_holdout/train.py --train-days 5 6 7 --val-days 8
+
+    # 四折 leave-one-day-out（para1: days 1 2 3 4；para2 用 --days 5 6 7 8）
+    uv run python char_token_day_holdout/four_fold.py
 """
 
 from char_token_day_holdout.split import split_by_day

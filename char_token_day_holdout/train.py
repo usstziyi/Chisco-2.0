@@ -15,6 +15,11 @@ train / val 的句子集合完全重合，因此这里的 val 指标衡量的是
     uv run python char_token_day_holdout/train.py
     uv run python char_token_day_holdout/train.py --epochs 20 --seed 0
     uv run python char_token_day_holdout/train.py --train-days 5 6 7 --val-days 8
+
+    uv run python char_token_day_holdout/train.py --train-days 2 3 4 --val-days 1
+    uv run python char_token_day_holdout/train.py --train-days 1 3 4 --val-days 2
+    uv run python char_token_day_holdout/train.py --train-days 1 2 4 --val-days 3
+    uv run python char_token_day_holdout/train.py --train-days 1 2 3 --val-days 4
 """
 
 from __future__ import annotations
