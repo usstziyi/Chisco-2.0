@@ -43,12 +43,10 @@ train / val 按 **句子** 做 8:2 切分（不是按 trial），保证同一句
 文本侧用冻结的 LaBSE，所有句子的文本 embedding 在训练前一次性算好、做成查表，
 训练时只做索引，不重复跑 LaBSE。
 
-用法::
+用法:
 
     uv run python char_token/train.py
     uv run python char_token/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4
-    uv run python char_token/train.py --day 1 2 3 4 --lr-schedule none --weight-decay 0
-    uv run python char_token/train.py --select-by eeg2text_top5
     uv run python char_token/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4 --epochs 20 --seed 0
 """
 
@@ -314,8 +312,8 @@ def parse_args():
     parser.add_argument("--char-duration", type=float, default=0.4, help="每个字 token 的时长（秒，默认 0.4）")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="验证集句子比例（默认 0.2）")
     parser.add_argument(
-        "--n-sentences", type=int, default=8,
-        help="每个训练 batch 里不同句子的数量（默认 8）",
+        "--n-sentences", type=int, default=32,
+        help="每个训练 batch 里不同句子的数量（默认 32）",
     )
     parser.add_argument(
         "--n-repeats", type=int, default=4,

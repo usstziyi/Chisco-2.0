@@ -9,6 +9,7 @@ train/val、检索评测、CSV 日志全部复用 ``char_token`` 里的同一份
     uv run python char_token_pooling/train.py --pooling mean
     # 一次跑完两种变体（顺序执行）：
     uv run python char_token_pooling/train.py --pooling attn mean
+    uv run python char_token_pooling/train.py --subject sub-01 --day 1 2 3 4 --n-sentences 32 --n-repeats 4  --pooling attn mean
 """
 
 from __future__ import annotations
@@ -64,8 +65,8 @@ def parse_args():
     parser.add_argument("--char-duration", type=float, default=0.4, help="每个字 token 的时长（秒，默认 0.4）")
     parser.add_argument("--val-ratio", type=float, default=0.2, help="验证集句子比例（默认 0.2）")
     parser.add_argument(
-        "--n-sentences", type=int, default=8,
-        help="每个训练 batch 里不同句子的数量（默认 8）",
+        "--n-sentences", type=int, default=32,
+        help="每个训练 batch 里不同句子的数量（默认 32）",
     )
     parser.add_argument(
         "--n-repeats", type=int, default=4,
