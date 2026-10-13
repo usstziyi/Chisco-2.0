@@ -454,7 +454,7 @@ def main():
 
     # ---------------- 训练 ----------------
     # 每次运行放入独立的时间戳子目录，便于区分不同次训练
-    out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.out_dir) / f"{args.subject}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / "best.pt"
     train_epochs_path = out_dir / "train_epochs.csv"
