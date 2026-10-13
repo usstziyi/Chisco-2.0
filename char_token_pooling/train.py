@@ -103,6 +103,10 @@ def run_variant(args, pooling, dataset, train_set, val_set, train_loader, val_lo
                 lookup, embedding_dim, device):
     """在给定池化方式下完整跑一遍训练 + 评测，返回 (best_score, metrics)。"""
     set_seed(args.seed)
+    # sampler 的 epoch 计数器跨变体会累计：不重置的话"单独跑某变体"与
+    # "和其他变体一起跑"会拿到不同的批次顺序，使池化之外又多出一个变量。
+    # 每个变体都从第 0 轮开始，保证各变体采样完全一致。
+    train_loader.batch_sampler.set_epoch(0)
 
     model = build_encoder(
         pooling,
@@ -302,7 +306,7 @@ def main():
             args, pooling, dataset, train_set, val_set,
             train_loader, val_loader, lookup, embedding_dim, device,
         )
-        summary[pooling] = {"best": best_score, **metrics}
+        summary[pooling] = {"best": best_score, **best_metrics}
 
     # ---------------- 汇总 ----------------
     if len(summary) > 1:
