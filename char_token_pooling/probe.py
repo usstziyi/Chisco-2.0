@@ -26,7 +26,7 @@ r"""长度探针：直接检验句嵌入是否线性编码了 token 个数（= �
 
     # 噪声对照：噪声模型的嵌入里是否还能读出长度（应为读不出）
     uv run python char_token_pooling/probe.py --pooling attn --input noise \\
-        --ckpt outputs/char_token_noise/<时间戳>/best.pt
+        --ckpt outputs/char_token_noise/<时间戳>/noise_sub-01_best.pt
 """
 
 from __future__ import annotations
@@ -53,8 +53,9 @@ POOLING_OUT_DIR = PROJECT_ROOT / "outputs" / "char_token_pooling"
 # ---------------------------------------------------------------- 基础工具
 
 
-def resolve_ckpt(pooling: str, ckpt: str | None) -> Path:
-    """给定 pooling 时，自动选 ``outputs/char_token_pooling/<pooling>_*/best.pt`` 里最新的一个。"""
+def resolve_ckpt(pooling: str, subject: str, ckpt: str | None) -> Path:
+    """给定 pooling 与被试时，自动选 ``outputs/char_token_pooling/<时间戳>/<pooling>_<subject>_best.pt``
+    里最新的一个（与 char_token_pooling/train.py 的输出布局一致）。"""
     if ckpt:
         path = Path(ckpt)
         if not path.exists():
@@ -62,12 +63,12 @@ def resolve_ckpt(pooling: str, ckpt: str | None) -> Path:
         return path
 
     candidates = sorted(
-        POOLING_OUT_DIR.glob(f"{pooling}_*/best.pt"),
+        POOLING_OUT_DIR.glob(f"*/{pooling}_{subject}_best.pt"),
         key=lambda p: p.stat().st_mtime,
     )
     if not candidates:
         raise FileNotFoundError(
-            f"在 {POOLING_OUT_DIR} 下找不到 {pooling}_*/best.pt，请用 --ckpt 显式指定"
+            f"在 {POOLING_OUT_DIR} 下找不到 */{pooling}_{subject}_best.pt，请用 --ckpt 显式指定"
         )
     return candidates[-1]
 
@@ -146,7 +147,7 @@ def main():
     set_seed(args.seed)
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    ckpt_path = resolve_ckpt(args.pooling, args.ckpt)
+    ckpt_path = resolve_ckpt(args.pooling, args.subject, args.ckpt)
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     print(f"[Ckpt] {ckpt_path}")
     print(
