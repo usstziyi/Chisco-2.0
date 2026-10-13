@@ -9,7 +9,7 @@ train/val、检索评测、CSV 日志全部复用 ``char_token`` 里的同一份
     uv run python char_token_pooling/train.py --pooling mean
     # 一次跑完两种变体（顺序执行）：
     uv run python char_token_pooling/train.py --pooling attn mean
-    uv run python char_token_pooling/train.py --subject sub-01 --day 1 2 3 4 --n-sentences 32 --n-repeats 4  --pooling attn mean
+    uv run python char_token_pooling/train.py --subject sub-01 --day 1 2 3 4 --n-sentences 32 --n-repeats 4  --pooling mean attn
 """
 
 from __future__ import annotations
