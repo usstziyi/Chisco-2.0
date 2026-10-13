@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 256" width="720" height="256">
+  <style>
+    text { font-family: "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", "Source Han Sans SC", "Segoe UI", system-ui, sans-serif; }
+    .head { fill: #171717; font-size: 16px; font-weight: 500; }
+    .th { fill: #171717; font-size: 14px; font-weight: 500; }
+    .ts { fill: #52525B; font-size: 12px; }
+    .th-focus { fill: #004D26; font-size: 14px; font-weight: 500; }
+    .ts-focus { fill: #004D26; font-size: 12px; }
+    .card { fill: #F7F7F8; stroke: #171717; stroke-opacity: 0.12; stroke-width: 1; }
+    .node { fill: #EFEFF2; stroke: #171717; stroke-opacity: 0.12; stroke-width: 1; }
+    .node-focus { fill: #E5FFF2; stroke: #0FDC78; stroke-width: 1; }
+    .arr { stroke: #52525B; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; fill: none; }
+    .divider { stroke: #171717; stroke-opacity: 0.12; stroke-width: 1; }
+    .cell-pos { fill: #0FDC78; }
+    .cell-neg { fill: #EFEFF2; stroke: #171717; stroke-opacity: 0.12; stroke-width: 1; }
+  </style>
+
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M1 1 L7 4 L1 7 Z" fill="#52525B"/>
+    </marker>
+  </defs>
+
+  <rect class="card" x="0" y="0" width="720" height="256" rx="12"/>
+
+  <text class="head" x="20" y="34">对称多正样本 InfoNCE（MP-CE）</text>
+
+  <rect class="node" x="41" y="54" width="130" height="76" rx="8"/>
+  <text class="th" x="106" y="88" text-anchor="middle">双向嵌入</text>
+  <text class="ts" x="106" y="110" text-anchor="middle">E, T（B×D）</text>
+
+  <rect class="node" x="215" y="54" width="140" height="76" rx="8"/>
+  <text class="th" x="285" y="88" text-anchor="middle">相似度矩阵</text>
+  <text class="ts" x="285" y="110" text-anchor="middle">S = E Tᵀ / τ</text>
+
+  <rect class="node-focus" x="399" y="54" width="140" height="76" rx="8"/>
+  <text class="th-focus" x="469" y="88" text-anchor="middle">多正样本 CE</text>
+  <text class="ts-focus" x="469" y="110" text-anchor="middle">对同句正样本平均</text>
+
+  <rect class="node" x="583" y="54" width="96" height="76" rx="8"/>
+  <text class="th" x="631" y="88" text-anchor="middle">对称损失</text>
+  <text class="ts" x="631" y="110" text-anchor="middle">½(L¹+L²)</text>
+
+  <path class="arr" d="M171 92 H211" marker-end="url(#arrow)"/>
+  <path class="arr" d="M355 92 H395" marker-end="url(#arrow)"/>
+  <path class="arr" d="M539 92 H579" marker-end="url(#arrow)"/>
+
+  <line class="divider" x1="20" y1="152" x2="700" y2="152"/>
+
+  <text class="ts" x="20" y="174">anchor i 的一行（128 列）</text>
+  <rect class="cell-pos" x="20" y="186" width="14" height="14"/>
+  <rect class="cell-pos" x="38" y="186" width="14" height="14"/>
+  <rect class="cell-pos" x="56" y="186" width="14" height="14"/>
+  <rect class="cell-pos" x="74" y="186" width="14" height="14"/>
+  <text class="ts" x="96" y="197">×4 同句</text>
+  <rect class="cell-neg" x="152" y="186" width="14" height="14"/>
+  <rect class="cell-neg" x="170" y="186" width="14" height="14"/>
+  <rect class="cell-neg" x="188" y="186" width="14" height="14"/>
+  <text class="ts" x="210" y="197">…</text>
+
+  <text class="ts" x="20" y="224">正样本 = 同句的 4 条（|Pᵢ| = 4），其余 124 列为负样本，只进 softmax 分母</text>
+</svg>
