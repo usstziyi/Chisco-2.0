@@ -77,12 +77,12 @@ def parse_args():
     parser.add_argument("--sample", type=int, default=250, help="采样率 Hz（默认 250）")
     parser.add_argument("--char-duration", type=float, default=0.4, help="每个字 token 的时长（秒，默认 0.4）")
     parser.add_argument(
-        "--n-sentences", type=int, default=32,
-        help="每个训练 batch 里不同句子的数量（默认 32）",
+        "--n-sentences", type=int, default=18,
+        help="每个训练 batch 里不同句子的数量（默认 18；252 句可整除，14 batch/epoch）",
     )
     parser.add_argument(
-        "--n-repeats", type=int, default=4,
-        help="每个句子在每个 batch 里抽多少条 trial 当正样本（默认 4）",
+        "--n-repeats", type=int, default=3,
+        help="每个句子在每个 batch 里抽多少条 trial 当正样本（默认 3；day-05 每句最多 3 条）",
     )
     parser.add_argument("--batch-size", type=int, default=32, help="验证集 DataLoader 的 batch 大小（默认 32）")
     parser.add_argument("--epochs", type=int, default=30, help="训练轮数（默认 30）")
