@@ -144,9 +144,13 @@ def build_dataset(args, source):
     )
 
 
-def run_variant(args, source, dataset, train_set, val_set, train_loader, val_loader,
-                lookup, embedding_dim, device):
-    """在给定数据来源（eeg / noise）下完整跑一遍训练 + 评测，返回 (best_score, metrics)。"""
+def run_variant(args, source, out_dir, dataset, train_set, val_set, train_loader,
+                val_loader, lookup, embedding_dim, device):
+    """在给定数据来源（eeg / noise）下完整跑一遍训练 + 评测，返回 (best_score, metrics)。
+
+    所有对照臂共用 ``main`` 里创建好的同一个时间戳目录 ``out_dir``，
+    文件以 ``{input}_{subject}`` 前缀区分（如 ``noise_sub-01_train_epochs.csv``）。
+    """
     # 每个变体重置随机种子，让两臂拿到完全相同的初始权重与采样，
     # 从而保证"数据来源"是唯一变量。
     set_seed(args.seed)
@@ -172,11 +176,10 @@ def run_variant(args, source, dataset, train_set, val_set, train_loader, val_loa
         else None
     )
 
-    out_dir = Path(args.out_dir) / f"{source}_{args.subject}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / "best.pt"
-    train_epochs_path = out_dir / "train_epochs.csv"
-    train_steps_path = out_dir / "train_steps.csv"
+    # 同一次运行的所有对照臂共用一个时间戳目录，文件以"{对照臂}_{被试}"前缀区分
+    ckpt_path = out_dir / f"{source}_{args.subject}_best.pt"
+    train_epochs_path = out_dir / f"{source}_{args.subject}_train_epochs.csv"
+    train_steps_path = out_dir / f"{source}_{args.subject}_train_steps.csv"
 
     lower_is_better = args.select_by == "val_loss"
     best_score = float("inf") if lower_is_better else -float("inf")
@@ -284,6 +287,10 @@ def main():
         if args.num_workers > 0 and args.noise_refresh == "epoch":
             print("[Warn] num-workers>0 时每轮换噪不会生效（子进程里 dataset 副本的 epoch 不会更新）")
 
+    # 同一次运行共用一个时间戳输出目录，各对照臂的文件以 "{对照臂}_{被试}" 前缀区分
+    out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     # ---------------- 逐个对照臂训练 ----------------
     lookup, embedding_dim = None, None
     summary = {}
@@ -359,7 +366,7 @@ def main():
 
         # ---------------- 训练 + 评测 ----------------
         best_score, best_metrics = run_variant(
-            args, source, dataset, train_set, val_set,
+            args, source, out_dir, dataset, train_set, val_set,
             train_loader, val_loader, lookup, embedding_dim, device,
         )
         summary[source] = {"best": best_score, **best_metrics}
@@ -388,6 +395,7 @@ def main():
             "[判读] noise 落在随机基线附近 -> eeg 的成绩依赖真实脑电；"
             "noise 仍显著更高 -> 存在与信号无关的泄漏通道。"
         )
+    print(f"\n[Output] {out_dir}")
 
 
 if __name__ == "__main__":

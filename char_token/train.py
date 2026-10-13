@@ -3,6 +3,8 @@
 数据
 ----
 被试 / 天数 / 事件类型 / 采样率均可通过命令行指定，默认 sub-01 + day-01。
+``--subject`` 可一次传多个被试（如 ``--subject sub-01 sub-02``），脚本会顺序跑完每个被试
+做对照；所有被试共用同一个时间戳输出目录，CSV / checkpoint 以被试名前缀区分。
 train / val 按 **句子** 做 8:2 切分（不是按 trial），保证同一句子的所有 trial
 只会落在同一侧，不会跨集泄漏。
 
@@ -48,6 +50,8 @@ train / val 按 **句子** 做 8:2 切分（不是按 trial），保证同一句
     uv run python char_token/train.py
     uv run python char_token/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4
     uv run python char_token/train.py --day 1 2 3 4 --n-sentences 32 --n-repeats 4 --epochs 20 --seed 0
+    # 一次跑完 sub-01 / sub-02 对照（共用一个时间戳输出目录）：
+    uv run python char_token/train.py --subject sub-01 sub-02 --day 1 2 3 4 --n-sentences 32 --n-repeats 4
 """
 
 from __future__ import annotations
@@ -299,7 +303,10 @@ def evaluate(model, loader, lookup, device, temperature) -> dict:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="字符级 token EEG–文本对比学习训练。")
-    parser.add_argument("--subject", default="sub-01", help="被试，如 sub-01")
+    parser.add_argument(
+        "--subject", nargs="+", default=["sub-01"],
+        help="被试，可传多个一次跑完对照，如 --subject sub-01 sub-02；默认 sub-01",
+    )
     parser.add_argument(
         "--day", type=int, nargs="+", default=[1],
         help="day 编号（1~8），可传多个，如 --day 1 2 3 4；默认 1",
@@ -340,24 +347,21 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def run_subject(args, subject, out_dir, text_encoder, device):
+    """对单个被试完整跑一遍训练 + 评测，返回 ``(best_score, best_metrics)``。
+
+    所有被试共用 ``main`` 里创建好的同一个时间戳目录 ``out_dir``，
+    CSV / checkpoint 以被试名前缀区分（如 ``sub-01_train_epochs.csv``）。
+    """
     set_seed(args.seed)
 
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    )
-    print(f"[Config] device={device} temperature={args.temperature} "
-          f"batch={args.n_sentences}句×{args.n_repeats}视图 "
-          f"epochs={args.epochs} lr={args.lr} wd={args.weight_decay} "
-          f"schedule={args.lr_schedule} select={args.select_by} seed={args.seed}")
-
+    print(f"\n{'=' * 88}\n[Subject] {subject}\n{'=' * 88}")
 
     # ---------------- 数据 ----------------
     dataset = CharTokenEEGDataset(
         event=args.event,
         sample=args.sample,
-        subject=args.subject,
+        subject=subject,
         days=args.day,
         char_duration=args.char_duration,
     )
@@ -366,7 +370,7 @@ def main():
 
     days_label = ",".join(f"{d:02d}" for d in sorted(args.day))
     print(
-        f"[Data] {args.subject} day-{days_label} event={args.event} "
+        f"[Data] {subject} day-{days_label} event={args.event} "
         f"token_samples={dataset.token_samples} n_chans={dataset.n_chans}\n"
         f"       句子 {len(dataset.meta['sentence'].unique())} 条 -> "
         f"train {info['n_unique_train']} / val {info['n_unique_val']} "
@@ -420,12 +424,10 @@ def main():
     )
 
     # ---------------- 文本 embedding（冻结，一次性算好） ----------------
-    print("[Text] 加载 LaBSE 并预计算全部句子 embedding ...")
-    text_encoder = LaBSETextEncoder()
     lookup, embedding_dim = build_text_lookup(
         text_encoder, dataset.meta["sentence"].tolist(), device
     )
-    print(f"       已缓存 {len(lookup)} 条句子，embedding_dim={embedding_dim}")
+    print(f"[Text] 已缓存 {len(lookup)} 条句子，embedding_dim={embedding_dim}")
 
     # ---------------- 模型 ----------------
     model = CharTokenEEGEncoder(
@@ -451,15 +453,14 @@ def main():
     )
 
     # ---------------- 训练 ----------------
-    # 每次运行放入独立的时间戳子目录，便于区分不同次训练
-    out_dir = Path(args.out_dir) / f"{args.subject}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / "best.pt"
-    train_epochs_path = out_dir / "train_epochs.csv"
-    train_steps_path = out_dir / "train_steps.csv"
+    # 所有被试共用同一时间戳目录，文件以被试名前缀区分
+    ckpt_path = out_dir / f"{subject}_best.pt"
+    train_epochs_path = out_dir / f"{subject}_train_epochs.csv"
+    train_steps_path = out_dir / f"{subject}_train_steps.csv"
 
     lower_is_better = args.select_by == "val_loss"
     best_score = float("inf") if lower_is_better else -float("inf")
+    best_metrics = None
     header = (
         f"{'epoch':>5} {'lr':>8} {'train_loss':>10} {'pos/anch':>9} {'val_loss':>9} "
         f"{'e2t@1':>7} {'e2t@5':>7} {'t2e@1':>7} {'t2e@5':>7}"
@@ -482,6 +483,7 @@ def main():
         flag = ""
         if improved:
             best_score = score
+            best_metrics = dict(metrics)
             flag = " *"
             torch.save(
                 {
@@ -537,6 +539,55 @@ def main():
         f"       epochs:     {train_epochs_path}\n"
         f"       steps:      {train_steps_path}"
     )
+    return best_score, best_metrics
+
+
+def main():
+    args = parse_args()
+    set_seed(args.seed)
+
+    device = torch.device(
+        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    print(f"[Config] device={device} subjects={args.subject} temperature={args.temperature} "
+          f"batch={args.n_sentences}句×{args.n_repeats}视图 "
+          f"epochs={args.epochs} lr={args.lr} wd={args.weight_decay} "
+          f"schedule={args.lr_schedule} select={args.select_by} seed={args.seed}")
+
+    # 所有被试共用同一个时间戳目录，文件以被试名前缀区分
+    out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # LaBSE 只加载一次，各被试复用同一个文本编码器
+    print("[Text] 加载 LaBSE（冻结） ...")
+    text_encoder = LaBSETextEncoder()
+
+    # ---------------- 逐个被试训练 ----------------
+    summary = {}
+    for subject in args.subject:
+        best_score, best_metrics = run_subject(
+            args, subject, out_dir, text_encoder, device
+        )
+        summary[subject] = {"best": best_score, **best_metrics}
+
+    # ---------------- 汇总 ----------------
+    if len(summary) > 1:
+        print(f"\n{'=' * 88}\n[Summary] 被试对照（best by {args.select_by}）\n{'=' * 88}")
+        print(f"{'subject':>8} {'val_loss':>10} {'e2t@1':>8} {'e2t@5':>8} {'t2e@1':>8} {'t2e@5':>8}")
+        for subject, m in summary.items():
+            print(
+                f"{subject:>8} {m['val_loss']:>10.4f} {m['eeg2text_top1']:>8.4f} "
+                f"{m['eeg2text_top5']:>8.4f} {m['text2eeg_top1']:>8.4f} {m['text2eeg_top5']:>8.4f}"
+            )
+        n_cand = next(iter(summary.values()))["n_text_candidates"]
+        n_val = next(iter(summary.values()))["n_val"]
+        pos_per_anchor = next(iter(summary.values()))["pos_per_anchor"]
+        print(
+            f"\n[Baseline] eeg2text 候选 {n_cand} 句，随机 top-1={1 / n_cand:.4f} "
+            f"top-5={min(5, n_cand) / n_cand:.4f}；text2eeg 候选 {n_val} 条，"
+            f"随机 top-5={min(5 * pos_per_anchor / n_val, 1.0):.4f}"
+        )
+    print(f"\n[Output] {out_dir}")
 
 
 if __name__ == "__main__":

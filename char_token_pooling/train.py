@@ -100,9 +100,13 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_variant(args, pooling, dataset, train_set, val_set, train_loader, val_loader,
-                lookup, embedding_dim, device):
-    """在给定池化方式下完整跑一遍训练 + 评测，返回 (best_score, metrics)。"""
+def run_variant(args, pooling, out_dir, dataset, train_set, val_set, train_loader,
+                val_loader, lookup, embedding_dim, device):
+    """在给定池化方式下完整跑一遍训练 + 评测，返回 (best_score, metrics)。
+
+    所有变体共用 ``main`` 里创建好的同一个时间戳目录 ``out_dir``，
+    文件以 ``{pooling}_{subject}`` 前缀区分（如 ``attn_sub-01_train_epochs.csv``）。
+    """
     set_seed(args.seed)
     # sampler 的 epoch 计数器跨变体会累计：不重置的话"单独跑某变体"与
     # "和其他变体一起跑"会拿到不同的批次顺序，使池化之外又多出一个变量。
@@ -131,11 +135,10 @@ def run_variant(args, pooling, dataset, train_set, val_set, train_loader, val_lo
         else None
     )
 
-    out_dir = Path(args.out_dir) / f"{pooling}_{args.subject}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / "best.pt"
-    train_epochs_path = out_dir / "train_epochs.csv"
-    train_steps_path = out_dir / "train_steps.csv"
+    # 同一次运行的所有变体共用一个时间戳目录，文件以"{变体}_{被试}"前缀区分
+    ckpt_path = out_dir / f"{pooling}_{args.subject}_best.pt"
+    train_epochs_path = out_dir / f"{pooling}_{args.subject}_train_epochs.csv"
+    train_steps_path = out_dir / f"{pooling}_{args.subject}_train_steps.csv"
 
     lower_is_better = args.select_by == "val_loss"
     best_score = float("inf") if lower_is_better else -float("inf")
@@ -300,11 +303,15 @@ def main():
     )
     print(f"       已缓存 {len(lookup)} 条句子，embedding_dim={embedding_dim}")
 
+    # 同一次运行共用一个时间戳输出目录，各变体的文件以 "{变体}_{被试}" 前缀区分
+    out_dir = Path(args.out_dir) / datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     # ---------------- 逐个池化变体训练 ----------------
     summary = {}
     for pooling in args.pooling:
-        best_score, metrics = run_variant(
-            args, pooling, dataset, train_set, val_set,
+        best_score, best_metrics = run_variant(
+            args, pooling, out_dir, dataset, train_set, val_set,
             train_loader, val_loader, lookup, embedding_dim, device,
         )
         summary[pooling] = {"best": best_score, **best_metrics}
@@ -325,6 +332,7 @@ def main():
             f"top-5={min(5, n_cand) / n_cand:.4f}；text2eeg 候选 {n_val} 条，"
             f"随机 top-5={min(5 * 4 / n_val, 1.0):.4f}"
         )
+    print(f"\n[Output] {out_dir}")
 
 
 if __name__ == "__main__":
