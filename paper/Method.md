@@ -175,9 +175,21 @@ token 做加权汇总：
 
 $$\mathbf{z}^{\text{pool}} = \mathrm{MHA}(\mathbf{q},\, \mathbf{H},\, \mathbf{H};\, \text{mask}) \in \mathbb{R}^{B \times 1 \times d}$$
 
-**为什么不用 mean-pool**：token 个数恰好等于字符数，mean-pool 会让模型可以靠"平均了多少个 token"
-反推句子长度；可学习 query 的加权汇总表达力更强，也避免了这种**计数泄漏**。这一设计正是 2.10 的
-噪声对照所重点检验的对象。
+**为什么用 attention pooling 而不是 mean-pool**：token 个数恰好等于字符数，mean-pool 的输出统计量会随
+token 个数变化，理论上更容易让模型靠"平均了多少个 token"反推句子长度（**计数泄漏**）；可学习 query 的
+加权汇总表达力更强，故本文默认采用 attention pooling。
+
+但这一点**必须用实验说话，不能只凭直觉**（协议见 2.11，结果见池化消融）：
+
+- **表示层面：成立。** 长度探针显示，mean-pool 的句嵌入比 attention pooling **携带更多可线性读出的
+  长度信息**（ridge 探针 val $R^2 \approx 0.29$ vs $0.12$，Spearman $\rho \approx 0.57$ vs $0.37$）。
+- **任务层面：不成立。** 这一差异**没有**转化为检索优势：两种池化在 900 条 val 上的 `eeg2text` /
+  `text2eeg` 指标统计上不可区分（差异全落在"单条翻转 $=0.11\%$"的噪声量级内），mean-pool 的
+  `best val_loss` 甚至略低。**因此不能断言 attention pooling 在端到端性能上更优。**
+- **上界：仅靠长度不足以致胜。** 噪声对照模型（2.10）的嵌入几乎完美编码了长度（探针 $R^2 \approx 0.99$），
+  但其检索指标精确停在随机基线 —— 说明即使长度被最大程度地编码，也不足以抬高检索成绩。
+
+综上，本文将 attention pooling 定位为一种**更少保留长度冗余**的设计选择，而**不是性能优势的来源**。
 
 最后经线性投影到共享嵌入维度 $D$ 并做 L2 归一化：
 
@@ -332,7 +344,27 @@ top-$k$ = $1/N$），则支持"成绩来自真实信号"；若仍显著高于随
 
 ---
 
-## 2.11 复现信息
+## 2.11 长度泄漏诊断协议（长度探针）
+
+端到端检索指标在 900 条 val 上噪声过大（单条翻转 $=0.11\%$），不足以判定"计数泄漏"。因此直接检验
+**句嵌入是否线性编码了 token 个数**：
+
+> 注意 $n_{\text{tok}}$ 对模型而言**始终可得**（mask 每行求和即为它）。本协议问的不是"模型能否拿到长度"，
+> 而是"池化之后的**句嵌入**是否还保留了长度"。
+
+协议（实现见 `char_token_pooling/probe.py`）：
+
+1. **长度探针**：冻住编码器，取 train / val 的句嵌入 $\mathbf{e}\in\mathbb{R}^{768}$，在 **train** 上拟合
+   ridge 回归 $\mathbf{e}\mapsto n_{\text{tok}}$（特征标准化、目标中心化，闭式解），在 **val** 上报告
+   $R^2$、MAE、Spearman $\rho$。以"打乱 train 标签后重拟合"为零假设对照（应 $\le 0$），
+   以"直接预测 train 均值"为平凡下界（$R^2 = 0$）。
+2. **按长度分层的检索**：口径与 2.9 的 `eeg2text` 完全一致，按 $n_{\text{tok}}$ 分桶报告 top-1 / top-5。
+   若模型靠长度取巧，性能应随长度明显分档。
+3. **对照**：同一协议施加于噪声对照模型的 checkpoint（2.10），其 $R^2$ 给出"纯长度信息"能达到的上界。
+
+---
+
+## 2.12 复现信息
 
 | 组件 | 版本 |
 |---|---|
@@ -344,8 +376,8 @@ top-$k$ = $1/N$），则支持"成绩来自真实信号"；若仍显著高于随
 | pyprep / mne-icalabel / autoreject | 0.9.0 / 0.10.0 / 0.5.1 |
 
 代码：`char_token/`（数据集 `dataset.py`、模型 `model.py`、采样 `sampler.py`、文本编码 `text_encoder.py`、
-训练 `train.py`）、`char_token_noise/`（噪声对照）、预处理 `script/preprocessing.py`、文本汇总
-`script/summarize_text.py`。
+训练 `train.py`）、`char_token_noise/`（噪声对照）、`char_token_pooling/`（池化消融 `model.py`/`train.py`、
+长度探针 `probe.py`）、预处理 `script/preprocessing.py`、文本汇总 `script/summarize_text.py`。
 
 ---
 
@@ -370,9 +402,9 @@ top-$k$ = $1/N$），则支持"成绩来自真实信号"；若仍显著高于随
 |---|---|
 | 贡献明确 | ✅ 字符级等长 token 化 + 抗泄漏评测协议 |
 | 表述清晰 | ✅ 每小节先给形状/公式再给理由，符号表统一 |
-| 实验强度 | ⚠️ 目前单被试、20 epoch；终版需多被试 + 训到收敛 |
-| 评估完整 | ⚠️ 缺 baseline 与消融（pooling / sampler / token 时长 / GroupNorm） |
-| 方法合理 | ✅ 每个设计选择均给出理由（权重共享、GroupNorm、attn pool、分组采样） |
+| 实验强度 | ⚠️ 目前单被试、20 epoch、单种子；终版需多被试 + 训到收敛 |
+| 评估完整 | ⚠️ 已完成池化消融与长度探针；仍缺 baseline、其余消融（sampler / token 时长 / GroupNorm） |
+| 方法合理 | ✅ 各设计选择均给出理由；池化一项**已按消融结果修正为"减少长度冗余"而非"性能优势"** |
 
 ## 附 C · Claim–Evidence 映射（Method 节相关）
 
@@ -380,6 +412,8 @@ top-$k$ = $1/N$），则支持"成绩来自真实信号"；若仍显著高于随
 |---|---|---|
 | 字符化 token 化能无损处理变长 EEG | 8528 条试次 100% 可被 100 整除，无丢弃 | supported |
 | GroupNorm 避免 padding 污染 | 代码实现 + 待补对照实验 | needs evidence |
-| attention pooling 优于 mean-pool（防计数泄漏） | 设计论证 + 待补消融 | needs evidence |
+| mean-pool 的句嵌入比 attention pooling 保留更多可线性读出的长度 | 长度探针：$R^2$ 0.29 vs 0.12，$\rho$ 0.57 vs 0.37，零假设 $\le 0$ | supported |
+| attention pooling 在端到端检索上**优于** mean-pool | 同配置消融：指标不可区分，mean 的 `best val_loss` 略低 | **refuted** |
+| 仅靠长度编码不足以抬高检索成绩 | 噪声对照模型探针 $R^2 \approx 0.99$，检索恰为随机基线（1/225、5/225） | supported |
 | 多正样本对称 InfoNCE 避免假负样本 | 分组采样下 `pos/anch = 4.00` | supported（需消融） |
 | 噪声对照可排除长度/架构旁路 | 噪声组精确落在理论基线 | supported |
