@@ -7,7 +7,9 @@
        （每一天录的试次完全相同，所以取一天即可，day 是单个整数）
     2. 用冻结的 LaBSE（来自 ``char_token.text_encoder``）编码成单位向量 (N, D)；
     3. 两两余弦相似度 >= --threshold 的句子并进同一组（单链接 / 并查集）；
-    4. 统计一共分成多少组、各组大小，打印非单例组明细，并存一份 CSV。
+    4. 统计一共分成多少组、各组大小，打印非单例组明细，并存一份 CSV；
+    5. 画两张相似度矩阵图："去除前"（全部句子）和"去除后"（仅保留单例句，
+       即不含在任何多句组里的句子），两图共用同一色标便于对比。
 
 单链接的含义：只要 A~B、B~C 各自超过阈值，A 和 C 就落进同一组，
 即使 A~C 本身没到阈值。阈值取高（默认 0.95，接近"同义/近重复"）时几乎不会链式串组。
@@ -205,24 +207,27 @@ def plot_similarity_matrix(
     subset,
     sentences,
     sim,
-    groups,
     threshold,
     day,
-    start: int = 0,
-    end: int | None = None,
+    select,
+    label: str,
+    tag: str = "",
+    stats: str = "",
 ):
-    """把句子两两余弦相似度矩阵画成热图并存 PNG（按句子原始顺序）。
+    """把选中句子的两两余弦相似度矩阵画成热图并存 PNG。
 
-    start / end：只画句子下标在 [start, end) 区间的子矩阵（end=None 表示到末尾），
-    适合句子很多时放大局部查看。
+    select：要画的句子下标（按给定顺序，通常是全部句子或仅保留的单例句）；
+    label：标题里的视图名（如"去除前"/"去除后"）；tag：文件名后缀，区分不同视图；
+    stats：标题第二行的补充统计。
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    n_total = len(sentences)
-    start = max(0, start)
-    end = n_total if end is None else min(end, n_total)
-    select = list(range(start, end))
+    select = list(select)
+    if not select:
+        print("[Skip] 没有可绘制的句子，跳过该相似度矩阵图")
+        return None
+
     ordered = sim[np.ix_(select, select)]
 
     n = len(select)
@@ -230,21 +235,19 @@ def plot_similarity_matrix(
     size = 8.0 if n <= 80 else min(20.0, 8.0 + (n - 80) * 0.05)
     fig, ax = plt.subplots(figsize=(size + 1.2, size))
 
+    # 用全量 sim 的最小值作 vmin，保证"去除前/后"两图色标一致，便于对比
     im = ax.imshow(ordered, cmap="viridis", vmin=float(sim.min()), vmax=1.0)
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="余弦相似度")
 
-    n_multi = sum(1 for g in groups if len(g) >= 2)
     subjects = "_".join(sorted(subset["subject"].unique()))
-    range_note = "" if (start, end) == (0, n_total) else f"（索引 {start}:{end}）"
     ax.set_title(
-        f"{subjects} day-{day:02d} 句子相似度矩阵{range_note}\n"
-        f"N={n}  阈值={threshold:g}  组数={len(groups)}  多句组={n_multi}"
+        f"{subjects} day-{day:02d} 句子相似度矩阵（{label}）\n"
+        f"N={n}  阈值={threshold:g}{stats}"
     )
     ax.set_xlabel("句子")
     ax.set_ylabel("句子")
 
     fig.tight_layout()
-    tag = "" if (start, end) == (0, n_total) else f"_idx{start}-{end}"
     path = out_dir / f"{subjects}_day-{day:02d}_thr{threshold:g}_simmatrix{tag}.png"
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -253,21 +256,13 @@ def plot_similarity_matrix(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LaBSE 编码 + 高相似度句子分组统计。")
-    parser.add_argument(
-        "--subject", nargs="+", default=["sub-01"], help="被试，默认 sub-01",
-    )
-    parser.add_argument(
-        "--day", type=int, default=1, help="day 编号（1~8），默认 1",
-    )
+    parser.add_argument("--subject", nargs="+", default=["sub-01"], help="被试，默认 sub-01")
+    parser.add_argument("--day", type=int, default=1, help="day 编号（1~8），默认 1")
     parser.add_argument("--sample", type=int, default=250, help="采样率 Hz（默认 250）")
-    parser.add_argument(
-        "--threshold", type=float, default=0.95, help="余弦相似度分组阈值（默认 0.95）",
-    )
+    parser.add_argument("--threshold", type=float, default=0.95, help="余弦相似度分组阈值（默认 0.95）")
     parser.add_argument("--top-k", type=int, default=10, help="打印最相似的多少对（默认 10）")
     parser.add_argument("--start", type=int, default=0, help="绘图起始句子下标（默认 0）")
-    parser.add_argument(
-        "--end", type=int, default=None, help="绘图结束句子下标，不含（默认到末尾）"
-    )
+    parser.add_argument("--end", type=int, default=None, help="绘图结束句子下标，不含（默认到末尾）")
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="分组 CSV 输出目录")
     return parser.parse_args()
 
@@ -297,18 +292,47 @@ def main():
     )
     print(f"\n[Saved] {path}")
 
-    fig_path = plot_similarity_matrix(
+    n_total = len(sentences)
+    n_multi = sum(1 for g in groups if len(g) >= 2)
+    # "去除后" = 只保留不含在任何多句组里的句子（单例句），保序遍历
+    kept = sorted(i for g in groups if len(g) == 1 for i in g)
+
+    # 去除前：全部句子（--start/--end 可截取局部放大）
+    start = max(0, args.start)
+    end = n_total if args.end is None else min(args.end, n_total)
+    zoom_note = "" if (start, end) == (0, n_total) else f"（索引 {start}:{end}）"
+    print(f"\n[Plot] 去除前：{end - start} 句；去除后：{len(kept)} 句（剔除 {n_total - len(kept)} 句）")
+
+    before_path = plot_similarity_matrix(
         Path(args.out_dir),
         subset,
         sentences,
         sim,
-        groups,
         args.threshold,
         args.day,
-        start=args.start,
-        end=args.end,
+        list(range(start, end)),
+        label=f"去除前{zoom_note}",
+        tag="_before" + ("" if (start, end) == (0, n_total) else f"_idx{start}-{end}"),
+        stats=f"  组数={len(groups)}  多句组={n_multi}",
     )
-    print(f"[Saved] {fig_path}")
+    if before_path is not None:
+        print(f"[Saved] {before_path}")
+
+    # 去除后：仅保留单例句（与原图共用色标，便于对比）
+    after_path = plot_similarity_matrix(
+        Path(args.out_dir),
+        subset,
+        sentences,
+        sim,
+        args.threshold,
+        args.day,
+        kept,
+        label="去除后·仅保留单例句",
+        tag="_after",
+        stats=f"  剔除 {n_total - len(kept)} 句",
+    )
+    if after_path is not None:
+        print(f"[Saved] {after_path}")
 
 
 if __name__ == "__main__":
