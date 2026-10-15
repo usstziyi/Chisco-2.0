@@ -118,8 +118,8 @@ class EEGNetTokenEncoder(nn.Module):
         F2: int | None = None,
         K: int = 25,
         K2: int = 15,
-        pool1: int = 4,
-        pool2: int = 4,
+        pool1: int = 2,
+        pool2: int = 5,
         drop_prob: float = 0.3,
     ):
         super().__init__()
