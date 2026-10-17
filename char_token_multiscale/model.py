@@ -51,6 +51,10 @@ def _split_channels(k: int, n_branches: int) -> list[int]:
 class MultiScaleTemporalConv(nn.Module):
     """并行多支时间卷积，same padding 保证各支输出时间长度一致。
 
+    padding 使用 ``replicate`` 而非默认的补零：token 只是连续 EEG 的一段切片，
+    补零会在两端制造人为阶跃，且核越宽污染越重（17 抽头时两端各 8 个采样点）。
+    复制边界值不改变任何维度，但对生理信号更合理。
+
     输入 ``(N, 1, C, T)`` -> 输出 ``(N, k, C, T)``，通道维由各分支拼接而成。
 
     Parameters
@@ -82,7 +86,13 @@ class MultiScaleTemporalConv(nn.Module):
         self.kernels = kernels
         self.branch_channels = tuple(branch_channels)
         self.branches = nn.ModuleList(
-            nn.Conv2d(1, out_ch, kernel_size=(1, m), padding=(0, m // 2))
+            # replicate：token 是连续 EEG 的切片，补零相当于在两端叠加一个归零阶跃，
+            # 受影响的位置数随 m//2 增长（3/7/17 对应两端各 1/3/8 个采样点）。
+            # 复制边界值消除了这一数值阶跃，但仍假设边界外局部恒定，是近似而非真实信号。
+            nn.Conv2d(
+                1, out_ch, kernel_size=(1, m), padding=(0, m // 2),
+                padding_mode="replicate",
+            )
             for out_ch, m in zip(branch_channels, kernels)
         )
 
