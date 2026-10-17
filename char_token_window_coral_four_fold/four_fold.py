@@ -82,12 +82,12 @@ def parse_args(argv=None):
         help="多尺度时间卷积的核宽（奇数，单位采样点，默认 5 15 35 75）",
     )
     parser.add_argument(
-        "--n-sentences", type=int, default=32,
-        help="每个训练 batch 里不同句子的数量（默认 32）",
+        "--n-sentences", type=int, default=42,
+        help="每个训练 batch 里不同句子的数量（默认 42）",
     )
     parser.add_argument(
-        "--n-repeats", type=int, default=4,
-        help="每个句子在每个 batch 里抽多少条 trial 当正样本（默认 4）",
+        "--n-repeats", type=int, default=3,
+        help="每个句子在每个 batch 里抽多少条 trial 当正样本（默认 3）",
     )
     parser.add_argument("--batch-size", type=int, default=32, help="验证集 DataLoader 的 batch 大小（默认 32）")
     parser.add_argument("--epochs", type=int, default=30, help="每折训练轮数（默认 30）")
