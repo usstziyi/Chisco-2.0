@@ -2,13 +2,15 @@
 
 列：sample / subject / day / run / trial_index /
     reading_onset / reading_sample / reading_dur_samples /
-    inner_onset / inner_sample / inner_dur_samples / sentence / n_chars
+    inner_onset / inner_sample / inner_dur_samples / sentence /
+    category_number / category_name / n_chars
 输出：datasets/preprocessed/all_text.tsv
 
 用法：
     uv run python script/summarize_text.py
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -17,6 +19,10 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PREPROCESSED_FOLDER = PROJECT_ROOT / "datasets" / "preprocessed"
 OUTPUT_PATH = PREPROCESSED_FOLDER / "all_text.tsv"
+
+JSON_FOLDER = PROJECT_ROOT / "datasets" / "json"
+TEXTMAPS_PATH = JSON_FOLDER / "textmaps.json"
+CLASSNUMBER_PATH = JSON_FOLDER / "classnumber.json"
 
 # 每个字符的时长（秒）；reading/inner 的持续时间都按它换算
 CHAR_DURATION = 0.4
@@ -31,6 +37,9 @@ SAMPLE_RATE_PATTERN = re.compile(r"(?P<sample>\d+)hz")
 
 
 def main():
+    textmaps = json.loads(TEXTMAPS_PATH.read_text(encoding="utf-8"))
+    classnames = json.loads(CLASSNUMBER_PATH.read_text(encoding="utf-8"))
+
     tsv_files = sorted(PREPROCESSED_FOLDER.rglob("*_text.tsv"))
 
     # 排除本脚本自己的输出文件
@@ -84,6 +93,22 @@ def main():
             "inner_dur_samples",
             inner_dur,
         )
+
+        # 按句子查类别号码、类别名称，插到 sentence 列后面
+        category_number = df["sentence"].map(textmaps)
+        category_name = category_number.map(
+            lambda number: classnames.get(str(int(number))) if pd.notna(number) else None
+        )
+        missing = category_number.isna()
+        if missing.any():
+            print(
+                f"[Warn] {tsv_path.name} 有 {missing.sum()} 条句子未匹配到类别: "
+                f"{sorted(df.loc[missing, 'sentence'].unique())}"
+            )
+
+        sentence_pos = df.columns.get_loc("sentence") + 1
+        df.insert(sentence_pos, "category_number", category_number)
+        df.insert(sentence_pos + 1, "category_name", category_name)
 
         frames.append(df)
         print(f"[Read] {tsv_path.name} ({len(df)} 行)")
