@@ -7,7 +7,8 @@
 2. 用 checkpoint 里存下的训练参数（subject / day / event / sample / char_duration）
    重建数据集，并按训练时**完全一致**的句子级切分（``val_ratio`` / ``seed``）取出预测集；
 3. 用模型把预测集**全体 trial** 编码成 L2 归一化的句嵌入 ``(N, D)``；
-4. 两两余弦相似度得到 ``N×N`` 矩阵（EEG×EEG 自相似），画成热图并存 PNG。
+4. 两两余弦相似度得到 ``N×N`` 矩阵（EEG×EEG 自相似），画成热图并存 PNG；
+5. 再按 **run** 把矩阵切片，**每个 run 单独一张图**（与全图共用同一色标，便于直接对比）。
 
 为什么看这张图
 --------------
@@ -33,6 +34,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from collections import Counter
 from pathlib import Path
@@ -132,8 +134,12 @@ def group_order(sentences) -> list[int]:
     return [pos for members in groups.values() for pos in members]
 
 
-def plot_matrix(out_dir, sim, n, subject, order_label, steps, seed, zoom_note, tag, stats):
-    """把选中的子矩阵画成热图并存 PNG。"""
+def plot_matrix(out_dir, matrix, filename, title, vmin, vmax=1.0) -> Path | None:
+    """把矩阵画成热图并存 PNG；``vmin`` / ``vmax`` 由调用方给定，便于多张图共用色标直接对比。"""
+    n = matrix.shape[0]
+    if n == 0:
+        return None
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -141,20 +147,51 @@ def plot_matrix(out_dir, sim, n, subject, order_label, steps, seed, zoom_note, t
     size = 8.0 if n <= 80 else min(20.0, 8.0 + (n - 80) * 0.05)
     fig, ax = plt.subplots(figsize=(size + 1.2, size))
 
-    im = ax.imshow(sim, cmap="viridis", vmin=float(sim.min()), vmax=1.0, interpolation="nearest")
+    im = ax.imshow(matrix, cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="余弦相似度（EEG 句嵌入）")
 
-    ax.set_title(
-        f"{subject} 预测集 EEG 句嵌入自相似矩阵（顺序={order_label}）\n"
-        f"N={n}  days={steps}  val_ratio={stats['val_ratio']:g}  seed={seed}{zoom_note}"
-    )
+    ax.set_title(title)
     ax.set_xlabel("trial")
     ax.set_ylabel("trial")
 
     fig.tight_layout()
-    path = out_dir / f"{subject}_val_simmatrix_{tag}.png"
+    path = out_dir / filename
     fig.savefig(path, dpi=200)
     plt.close(fig)
+    return path
+
+
+def save_order_csv(out_dir, subject, tag, meta, val_idx, select) -> Path:
+    """把**图上每一格**对应到原始 trial，导出 CSV 便于逐格对齐矩阵。
+
+    行 = 绘图顺序（plot_index 0..N-1）；列含该格来自哪个句子（group_id / slot_in_group）、
+    以及该 trial 的 day / run / trial_index / sentence。
+    ``slot_in_group`` 仅在 ``--order sentence`` 下有含义（0..3 对应该句的 day 1..4）。
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{subject}_val_simmatrix_{tag}_order.csv"
+
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            ["plot_index", "group_id", "slot_in_group", "day", "run", "trial_index", "sentence"]
+        )
+        group_id = -1
+        slot = 0
+        prev = None
+        for plot_index, pos in enumerate(select):
+            row = meta.iloc[val_idx[pos]]
+            sentence = str(row["sentence"])
+            if sentence != prev:
+                group_id += 1
+                slot = 0
+                prev = sentence
+            writer.writerow(
+                [plot_index, group_id, slot, int(row["day"]), int(row["run"]),
+                 int(row["trial_index"]), sentence]
+            )
+            slot += 1
     return path
 
 
@@ -266,12 +303,42 @@ def main():
 
     # ---------------- 绘图 ----------------
     out_dir = Path(args.out_dir) if args.out_dir is not None else ckpt_path.parent
-    path = plot_matrix(
-        out_dir, sub, len(select), subject, order_label, steps_label, seed,
-        zoom_note, tag, {"val_ratio": val_ratio},
+    # 所有图共用同一色标（全矩阵最小值 ~ 1.0），保证"全图 / 单 run"之间可直接对比
+    vmin = float(sim.min())
+
+    title = (
+        f"{subject} 预测集 EEG 句嵌入自相似矩阵（顺序={order_label}）\n"
+        f"N={len(select)}  days={steps_label}  val_ratio={val_ratio:g}  seed={seed}{zoom_note}"
     )
+    path = plot_matrix(out_dir, sub, f"{subject}_val_simmatrix_{tag}.png", title, vmin)
     print(f"\n[Plot] 子矩阵 {len(select)}×{len(select)}（{order_label}{zoom_note}）")
     print(f"[Output] {path}")
+
+    # ---------------- 每个 run 单独一张 ----------------
+    # run 取自预测集每条 trial 的 meta；用完整 order（不受 --start/--end 影响），
+    # 保证每张 run 图都覆盖该 run 的全部 trial。
+    run_of_pos = [int(dataset.meta["run"].tolist()[i]) for i in val_idx]
+    for run_id in sorted({run_of_pos[p] for p in order}):
+        sel_run = [p for p in order if run_of_pos[p] == run_id]
+        n_sent = len(dict.fromkeys(sentences[p] for p in sel_run))
+        title_run = (
+            f"{subject} 预测集 EEG 自相似矩阵（顺序={order_label}·run-{run_id}）\n"
+            f"N={len(sel_run)}  句数={n_sent}  days={steps_label}  "
+            f"val_ratio={val_ratio:g}  seed={seed}"
+        )
+        path_run = plot_matrix(
+            out_dir,
+            sim[np.ix_(sel_run, sel_run)],
+            f"{subject}_val_simmatrix_{tag}_run{run_id}.png",
+            title_run,
+            vmin,
+        )
+        print(f"[Plot] run-{run_id}: {len(sel_run)}×{len(sel_run)}（{n_sent} 句）")
+        print(f"[Output] {path_run}")
+
+    # 同步导出"图上每一格 -> 原始 trial"的映射，便于逐格对齐
+    csv_path = save_order_csv(out_dir, subject, tag, dataset.meta, val_idx, select)
+    print(f"[Output] {csv_path}")
 
 
 if __name__ == "__main__":
