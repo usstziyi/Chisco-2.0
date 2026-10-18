@@ -48,7 +48,7 @@ from char_token_bge_m3.text_encoder import BGEM3TextEncoder
 from char_token_bge_m3.train import build_text_lookup, gather_text, split_by_sentence
 
 # 复用绘图脚本里的工具函数（checkpoint 定位 / 编码 / 排序 / 画图 / 导出映射），避免重复实现。
-# 注意：import 该模块同时会把中文字体等 rcParams 设好。
+# 注意：import 该模块同时会把中文字体等 rcParams 设好；本脚本只通过参数覆盖轴/色标标签。
 from char_token_bge_m3.plot_sim_matrix import (
     encode_indices,
     find_ckpt,
@@ -221,6 +221,7 @@ def main():
     path = plot_matrix(
         out_dir, sub, f"{subject}_val_{tag}.png", title,
         vmin=float(sim.min()), vmax=float(sim.max()),
+        xlabel="trial（文本）", ylabel="trial（EEG）", cbar_label="余弦相似度（EEG × 文本）",
     )
     print(f"\n[Plot] {len(select)}×{len(select)}（{order_label}{zoom_note}）")
     print(f"[Output] {path}")

@@ -45,6 +45,7 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
+import seaborn as sns
 import torch
 from torch.utils.data import DataLoader, Subset
 
@@ -134,8 +135,15 @@ def group_order(sentences) -> list[int]:
     return [pos for members in groups.values() for pos in members]
 
 
-def plot_matrix(out_dir, matrix, filename, title, vmin, vmax=1.0) -> Path | None:
-    """把矩阵画成热图并存 PNG；``vmin`` / ``vmax`` 由调用方给定，便于多张图共用色标直接对比。"""
+def plot_matrix(
+    out_dir, matrix, filename, title, vmin, vmax=1.0,
+    xlabel="trial", ylabel="trial", cbar_label="余弦相似度（EEG 句嵌入）",
+) -> Path | None:
+    """用 seaborn ``sns.heatmap`` 把矩阵画成热图并存 PNG。
+
+    ``vmin`` / ``vmax`` 由调用方给定，便于多张图共用色标直接对比；轴标签与色标标签
+    可自定义，方便自相似（EEG×EEG）与跨模态（EEG×文本）共用同一个绘图函数。
+    """
     n = matrix.shape[0]
     if n == 0:
         return None
@@ -147,12 +155,23 @@ def plot_matrix(out_dir, matrix, filename, title, vmin, vmax=1.0) -> Path | None
     size = 8.0 if n <= 80 else min(20.0, 8.0 + (n - 80) * 0.05)
     fig, ax = plt.subplots(figsize=(size + 1.2, size))
 
-    im = ax.imshow(matrix, cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="余弦相似度（EEG 句嵌入）")
+    sns.heatmap(
+        matrix,
+        ax=ax,
+        cmap="viridis",
+        vmin=vmin,
+        vmax=vmax,
+        # xticklabels=False,
+        # yticklabels=False,
+        square=True,
+        linewidths=0.1,
+        linecolor="white",
+        cbar_kws={"shrink": 0.8,"label": cbar_label},
+    )
 
     ax.set_title(title)
-    ax.set_xlabel("trial")
-    ax.set_ylabel("trial")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
 
     fig.tight_layout()
     path = out_dir / filename
