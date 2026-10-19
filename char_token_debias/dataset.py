@@ -163,9 +163,14 @@ class CharTokenEEGDataset(Dataset):
         self._raw_cache: dict[Path, tuple] = {}
         self.n_chans: int | None = None
 
-        self.meta = subset[
-            ["sample", "subject", "day", "run", "trial_index", "sentence", "n_chars"]
-        ].copy()
+        meta_cols = [
+            "sample", "subject", "day", "run", "trial_index", "sentence", "n_chars",
+        ]
+        # 类别是 all_text.tsv 后来加上的列；有就带进 meta，评测时用它做类别控制
+        meta_cols += [
+            c for c in ("category_name", "category_number") if c in subset.columns
+        ]
+        self.meta = subset[meta_cols].copy()
         self.meta["event"] = event
         self.meta["start_sample"] = subset[self.sample_col].astype(int)
         self.meta["n_tokens"] = (subset[self.dur_col] // self.token_samples).astype(int)

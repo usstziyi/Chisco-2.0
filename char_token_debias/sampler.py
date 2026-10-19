@@ -149,6 +149,124 @@ class SentenceGroupBatchSampler(Sampler[list[int]]):
             yield batch
 
 
+class LengthBucketBatchSampler(Sampler[list[int]]):
+    """按**句长分桶**的句子分组采样器：一个 batch 内的句子句长相同。
+
+    动机
+    ----
+    run / 类别被去偏后，模型会退而使用"句长"这个跨天完全一致的线索：
+    同一句 4 天的字数相同，而且 token 个数恰好等于句长（inner 是 n_chars+1）。
+    于是只要把同长度句子放在同一个 batch，**句长在 batch 内就是常数**，
+    对 softmax 排序没有任何区分力，梯度不会再奖励"数 token"。
+
+    行为
+    ----
+    - 句子先按 ``n_chars`` 分桶；每桶内部再按 ``n_sentences`` 切块；
+    - 桶太小时（``< min_bucket`` 句）并入相邻桶，避免出现过小的 batch；
+    - 每个 batch = 桶内若干句 × ``n_repeats`` 视图，batch 大小可能略小于
+      ``n_sentences * n_repeats``（最后一组或小桶），这在对比损失里是允许的。
+
+    注意
+    ----
+    这不是"句长不变"的训练目标，而只是让句长在 batch 内失去判别力。
+    真正的句长控制还要配合 ``--length-residual linear``（推理时去掉句长方向）。
+    """
+
+    def __init__(
+        self,
+        sentences,
+        lengths,
+        n_sentences: int = 32,
+        n_repeats: int = 4,
+        seed: int | None = None,
+        shuffle: bool = True,
+        min_bucket: int = 4,
+    ):
+        if len(sentences) != len(lengths):
+            raise ValueError("sentences 与 lengths 长度必须一致")
+        if n_sentences <= 0 or n_repeats <= 0:
+            raise ValueError("n_sentences 与 n_repeats 必须为正")
+
+        groups: dict[str, list[int]] = defaultdict(list)
+        for index, sentence in enumerate(sentences):
+            groups[str(sentence)].append(index)
+
+        self.groups = {
+            s: idx for s, idx in groups.items() if len(idx) >= n_repeats
+        }
+        self.excluded_sentences = {
+            s: len(idx) for s, idx in groups.items() if len(idx) < n_repeats
+        }
+        if len(self.groups) < 2:
+            raise ValueError("可用句子不足 2 个，无法构造对比 batch")
+
+        # 句子 -> 句长（同一句的所有 trial 句长相同）
+        length_of = {}
+        for s, idx in self.groups.items():
+            length_of[s] = int(lengths[idx[0]])
+
+        raw_buckets: dict[int, list[str]] = defaultdict(list)
+        for s, L in length_of.items():
+            raw_buckets[L].append(s)
+
+        # 小桶并入相邻桶（先向前，再向后）
+        keys = sorted(raw_buckets)
+        buckets: dict[int, list[str]] = {}
+        for i, L in enumerate(keys):
+            pool = raw_buckets[L]
+            if len(pool) < min_bucket and buckets:
+                prev = sorted(buckets)[-1]
+                buckets[prev].extend(pool)
+            else:
+                buckets[L] = list(pool)
+        if len(buckets) == 1 and len(next(iter(buckets.values()))) < 2:
+            raise ValueError("句长分桶后可用句子不足 2 个")
+
+        self.buckets = {L: pool for L, pool in buckets.items() if len(pool) >= 2}
+        self.length_of = length_of
+        self.n_sentences = int(n_sentences)
+        self.n_repeats = int(n_repeats)
+        self.seed = seed
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+
+    @staticmethod
+    def _chunks(pool: list[str], k: int) -> list[list[str]]:
+        """把桶切成大小 k 的块；最后一块只有 1 句时并入前一块。"""
+        if len(pool) <= k:
+            return [pool]
+        out = [pool[i : i + k] for i in range(0, len(pool), k)]
+        if len(out) > 1 and len(out[-1]) < 2:
+            out[-2].extend(out[-1])
+            out.pop()
+        return out
+
+    def __len__(self) -> int:
+        return sum(len(self._chunks(pool, self.n_sentences)) for pool in self.buckets.values())
+
+    def __iter__(self):
+        rng = random.Random(None if self.seed is None else self.seed + self.epoch)
+        self.epoch += 1
+
+        keys = list(self.buckets)
+        if self.shuffle:
+            rng.shuffle(keys)
+
+        for L in keys:
+            pool = list(self.buckets[L])
+            if self.shuffle:
+                rng.shuffle(pool)
+            for chunk in self._chunks(pool, self.n_sentences):
+                batch: list[int] = []
+                for sentence in chunk:
+                    indices = self.groups[sentence]
+                    if self.shuffle:
+                        batch.extend(rng.sample(indices, self.n_repeats))
+                    else:
+                        batch.extend(indices[: self.n_repeats])
+                yield batch
+
+
 if __name__ == "__main__":
     from collections import Counter
 

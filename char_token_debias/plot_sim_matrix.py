@@ -102,8 +102,13 @@ def subject_from_ckpt(path: Path) -> str:
 
 
 @torch.no_grad()
-def encode(model, loader, device, debiaser_state, group_vocab) -> tuple[np.ndarray, list, list]:
-    """编码预测集，返回 ``(embeddings, sentences, groups)``。"""
+def encode(
+    model, loader, device, debiaser_state, group_vocab, length_state=None
+) -> tuple[np.ndarray, list, list]:
+    """编码预测集，返回 ``(embeddings, sentences, groups)``。
+
+    依次应用 checkpoint 里保存的两种去偏：``(day, run)`` 中心化 → 句长方向残差化。
+    """
     model.eval()
     parts, sentences, groups = [], [], []
     for tokens, mask, batch_sentences, batch_groups in loader:
@@ -119,6 +124,13 @@ def encode(model, loader, device, debiaser_state, group_vocab) -> tuple[np.ndarr
             [group_vocab[group_key(d, r)] for d, r in groups], device=emb.device
         )
         emb = torch.nn.functional.normalize(emb - means[idx], p=2, dim=-1)
+
+    if length_state is not None:
+        direction = length_state["direction"].to(emb.device)
+        projection = emb @ direction
+        emb = torch.nn.functional.normalize(
+            emb - projection.unsqueeze(1) * direction, p=2, dim=-1
+        )
 
     return emb.float().cpu().numpy(), sentences, groups
 
@@ -276,12 +288,17 @@ def main():
 
     debiaser_state = ckpt.get("debiaser")
     group_vocab = ckpt.get("group_vocab")
-    apply_debias = (
+    length_state = ckpt.get("length_residualizer")
+    apply_debias = bool(
         args.apply_debias == "on"
         or (args.apply_debias == "auto" and debiaser_state is not None and group_vocab)
     )
-    if args.apply_debias == "on" and not (debiaser_state and group_vocab):
-        raise ValueError("该 checkpoint 没有保存块均值，无法 --apply-debias on")
+    apply_length = bool(
+        args.apply_debias == "on"
+        or (args.apply_debias == "auto" and length_state is not None)
+    )
+    if args.apply_debias == "on" and not (debiaser_state or length_state):
+        raise ValueError("该 checkpoint 没有保存任何去偏参数，无法 --apply-debias on")
 
     loader = DataLoader(
         val_set, batch_size=args.batch_size, shuffle=False,
@@ -291,17 +308,21 @@ def main():
         emb, sentences, groups = encode(
             model, loader, device,
             debiaser_state if apply_debias else None, group_vocab,
+            length_state if apply_length else None,
         )
     n = len(sentences)
     print(
         f"[Enc] trial={n}，唯一句子={len(set(sentences))}，"
         f"块={len(set(groups))}，沿用 checkpoint 去偏={apply_debias}"
+        f"（句长残差化={apply_length}）"
     )
 
     # ---------------- 事后中心化（可叠加在 checkpoint 去偏之上） ----------------
     tag = "bysentence" if args.order == "sentence" else "raw"
     if apply_debias:
         tag += "_ckptdebias"
+    if apply_length:
+        tag += "_ckptlen"
     if args.center_by != "none":
         if args.center_by == "day-run":
             center_groups = [f"{d}-{r}" for d, r in groups]

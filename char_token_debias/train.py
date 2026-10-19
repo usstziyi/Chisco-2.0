@@ -7,7 +7,7 @@
 32 路候选砍到 8 路（loss 从 ln32 掉到 ln8），实验和可视化都证实：embedding
 ≈ run 均值 + 无句子信息的残差。
 
-本脚本按三步走：
+本脚本按四步走：
 
 1. **多视图**：``--day 1 2 3 4 --n-repeats 4``。同一句在 4 天各有一条 trial，
    互为正样本；模型才有"跨视图一致 = 保留、视图特异 = 丢弃"的判据。
@@ -16,11 +16,14 @@
    - ``ea``：输入空间欧氏对齐，按 ``(day, run)`` 去掉逐通道偏移与协方差差异；
    - ``center``：embedding 空间按 ``(day, run)`` 减去 EMA 均值；
    - ``ea+center``：两者叠加。
-3. **within-run 指标**：``e2t_run@k`` 与 ``val_loss_run`` 把候选池限制在同一个
-   ``(day, run)`` 块内（约 47~62 句），随机基线 1/n≈1.8%。全局 225 路检索会被
-   "跨 run 一眼可分"撑高，掩盖真实句级能力。默认按 ``cos_gap``（同句跨天余弦减去
-   同块异句余弦）选模型：它直接回答"句子身份是否独立于 run 块"，而 within-run
-   对比损失在表示变平时反而更低，容易选中还没学动的 epoch。
+3. **句长控制**（run/类别被去掉后，模型会退而使用句长）：
+   - ``--length-negatives``：按句长分桶采样，一个 batch 内句长相同，
+     句长在 softmax 里失去判别力；
+   - ``--length-residual linear``：在线估计并去掉 embedding 中线性可预测句长的方向。
+4. **分层指标**：``e2t_run@k``（同块）、``e2t_cat@k``（同块∩同类别）、
+   ``e2t_match@k``（同块∩同类别∩同句长）。随机基线分别约 1/56、1/20、1/4。
+   默认按 ``cos_gap_catlen``（同句跨天 − 同块同类同长异句）选模型，因为
+   不带句长控制的 ``cos_gap`` 会被"类别 + 句长"混淆。
 
 其余训练细节（LaBSE 冻结查表、按句子切分、多正样本 InfoNCE、余弦退火、
 句子分组采样）与 ``char_token/train.py`` 保持一致。
@@ -35,9 +38,15 @@
     uv run python char_token_debias/train.py --day 1 2 3 4 --debias ea
     uv run python char_token_debias/train.py --day 1 2 3 4 --debias center
 
+    # 句长控制：同长负样本 / 线性残差化 / 两者叠加
+    uv run python char_token_debias/train.py --day 1 2 3 4 --debias center --length-negatives
+    uv run python char_token_debias/train.py --day 1 2 3 4 --debias center --length-residual linear
+    uv run python char_token_debias/train.py --day 1 2 3 4 --debias center \
+        --length-negatives --length-residual linear
+
     # 快速冒烟
     uv run python char_token_debias/train.py --day 1 2 --n-sentences 8 --n-repeats 2 \
-        --epochs 1 --d-model 64 --n-layers 1
+        --epochs 1 --d-model 64 --n-layers 1 --length-negatives --length-residual linear
 """
 
 from __future__ import annotations
@@ -60,9 +69,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from char_token_debias.dataset import CharTokenEEGDataset, char_token_collate, group_key
-from char_token_debias.debias import GroupDebiaser
+from char_token_debias.debias import GroupDebiaser, LengthResidualizer
 from char_token_debias.model import CharTokenEEGEncoder
-from char_token_debias.sampler import SentenceGroupBatchSampler
+from char_token_debias.sampler import LengthBucketBatchSampler, SentenceGroupBatchSampler
 from char_token_debias.text_encoder import LaBSETextEncoder
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -72,10 +81,13 @@ EPOCH_LOG_FIELDS = [
     "epoch", "lr", "train_loss", "train_pos_per_anchor",
     "val_loss", "val_loss_run",
     "e2t@1", "e2t@5", "e2t_run@1", "e2t_run@5",
+    "e2t_cat@1", "e2t_cat@5", "e2t_match@1", "e2t_match@5",
     "t2e@1", "t2e@5", "t2e_xday@1", "t2e_xday@5",
     "cos_sent_xday", "cos_same_block_diff_sent", "cos_diff_block", "cos_gap",
+    "cos_gap_cat", "cos_gap_catlen",
     "n_val", "n_unique_sentences", "pos_per_anchor", "n_text_candidates",
-    "n_block_candidates", "is_best", "temperature", "debias",
+    "n_block_candidates", "n_cat_candidates", "n_match_candidates",
+    "is_best", "temperature", "debias", "length_negatives", "length_residual",
 ]
 
 TRAIN_STEP_FIELDS = [
@@ -212,7 +224,7 @@ def contrastive_loss(
 # 训练 / 评测
 # ----------------------------------------------------------------------
 def train_one_epoch(
-    model, debiaser, loader, lookup, optimizer, device, temperature,
+    model, debiaser, length_resid, loader, lookup, optimizer, device, temperature,
     epoch, step_log_path=None,
 ):
     """跑一个 epoch，返回 ``(平均 loss, 每个 anchor 的平均正样本数)``。"""
@@ -233,6 +245,13 @@ def train_one_epoch(
             resid = debiaser.residual_norm(raw, group_index)
         else:
             eeg, resid = raw, 0.0
+
+        # 句长控制：token 数 = 句长（inner 为 n_chars+1，单调等价），用它在 batch 内
+        # 估计并去掉"线性可预测句长"的方向。注意用的是去块均值后的表示。
+        if length_resid is not None:
+            lengths = mask.sum(dim=1).float()
+            length_resid.update(eeg.detach(), lengths)
+            eeg = length_resid(eeg)
 
         loss = contrastive_loss(eeg, text, temperature, groups_sent)
 
@@ -271,8 +290,14 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model, debiaser, loader, lookup, device, temperature) -> dict:
-    """在预测集上算全局 / within-run 检索指标与诊断余弦。"""
+def evaluate(
+    model, debiaser, length_resid, loader, lookup, device, temperature, val_meta
+) -> dict:
+    """在预测集上算全局 / within-run / within-category / 同长 检索与诊断余弦。
+
+    ``val_meta`` 必须与 DataLoader 的顺序一一对应（``shuffle=False``），用于取
+    ``category_name`` 与 ``n_chars``。类别缺失时相关指标返回 nan。
+    """
     model.eval()
 
     parts, sentences, groups = [], [], []
@@ -280,12 +305,16 @@ def evaluate(model, debiaser, loader, lookup, device, temperature) -> dict:
         raw = model(tokens.to(device), mask.to(device))
         if debiaser is not None:
             raw = debiaser(raw, debiaser.index(batch_groups).to(device))
+        if length_resid is not None:
+            raw = length_resid(raw)
         parts.append(raw)
         sentences.extend(batch_sentences)
         groups.extend(batch_groups)
 
     eeg = torch.cat(parts, dim=0)
     n = eeg.size(0)
+    if len(val_meta) != n:
+        raise ValueError(f"val_meta 行数 {len(val_meta)} 与评测样本数 {n} 不一致")
 
     uniq = sorted(set(sentences))
     sent_to_col = {s: i for i, s in enumerate(uniq)}
@@ -304,47 +333,103 @@ def evaluate(model, debiaser, loader, lookup, device, temperature) -> dict:
         "n_text_candidates": len(uniq),
     }
 
-    # ---- 全局 eeg -> text（候选 = 去重后的唯一句子） ----
-    ranked = (eeg @ text_all.t()).argsort(dim=1, descending=True)
-    hit = ranked.eq(target[:, None])
-    metrics["e2t@1"] = float(hit[:, :1].any(dim=1).float().mean())
-    metrics["e2t@5"] = float(hit[:, :5].any(dim=1).float().mean())
+    def topk(logits: torch.Tensor, tgt: torch.Tensor, k: int) -> float:
+        hit = logits.argsort(dim=1, descending=True).eq(tgt[:, None])
+        return float(hit[:, :k].any(dim=1).float().mean())
 
-    # ---- within-(day, run) eeg -> text：候选池限定在同一记录块 ----
+    # ---- 全局 eeg -> text（候选 = 去重后的唯一句子） ----
+    metrics["e2t@1"] = topk(eeg @ text_all.t(), target, 1)
+    metrics["e2t@5"] = topk(eeg @ text_all.t(), target, 5)
+
+    # ---- 数组：块 / 类别 / 句长 ----
     sent_arr = np.array(sentences, dtype=object)
     day_arr = np.array([g[0] for g in groups])
     run_arr = np.array([g[1] for g in groups])
+    block_arr = np.array([f"{d}-{r}" for d, r in groups], dtype=object)
+    len_arr = val_meta["n_chars"].to_numpy()
+    cat_arr = (
+        val_meta["category_name"].astype(str).to_numpy()
+        if "category_name" in val_meta.columns else None
+    )
 
+    # ---- within-(day, run) eeg -> text ----
     hit1_sum = hit5_sum = loss_sum = 0.0
     weight = 0
     cand_sizes = []
-    for day in sorted(set(day_arr)):
-        for run in sorted(set(run_arr)):
-            idx = np.where((day_arr == day) & (run_arr == run))[0]
-            if len(idx) == 0:
-                continue
-            idx_t = torch.as_tensor(idx, device=device)
-            cand = sorted({sentences[i] for i in idx})
-            cand_col = {s: i for i, s in enumerate(cand)}
-            tgt = torch.tensor([cand_col[sentences[i]] for i in idx], device=device)
-            logits = eeg[idx_t] @ gather_text(cand, lookup, device).t()
+    for block in sorted(set(block_arr)):
+        idx = np.where(block_arr == block)[0]
+        if len(idx) == 0:
+            continue
+        idx_t = torch.as_tensor(idx, device=device)
+        cand = sorted({sentences[i] for i in idx})
+        cand_col = {s: i for i, s in enumerate(cand)}
+        tgt = torch.tensor([cand_col[sentences[i]] for i in idx], device=device)
+        logits = eeg[idx_t] @ gather_text(cand, lookup, device).t()
 
-            rank = logits.argsort(dim=1, descending=True)
-            hit = rank.eq(tgt[:, None])
-            hit1_sum += float(hit[:, :1].any(1).float().mean()) * len(idx)
-            hit5_sum += float(hit[:, :5].any(1).float().mean()) * len(idx)
-
-            logp = logits / temperature
-            logp = logp - torch.logsumexp(logp, dim=1, keepdim=True)
-            loss_sum += float(-logp[torch.arange(len(idx), device=device), tgt].mean()) * len(idx)
-
-            weight += len(idx)
-            cand_sizes.append(len(cand))
+        hit1_sum += topk(logits, tgt, 1) * len(idx)
+        hit5_sum += topk(logits, tgt, 5) * len(idx)
+        logp = logits / temperature
+        logp = logp - torch.logsumexp(logp, dim=1, keepdim=True)
+        loss_sum += float(-logp[torch.arange(len(idx), device=device), tgt].mean()) * len(idx)
+        weight += len(idx)
+        cand_sizes.append(len(cand))
 
     metrics["e2t_run@1"] = hit1_sum / max(weight, 1)
     metrics["e2t_run@5"] = hit5_sum / max(weight, 1)
     metrics["val_loss_run"] = loss_sum / max(weight, 1)
     metrics["n_block_candidates"] = float(np.mean(cand_sizes)) if cand_sizes else 0.0
+
+    # ---- within-(block, category)：排除 run + 类别 ----
+    cat_h1 = cat_h5 = cat_w = 0.0
+    cat_sizes = []
+    if cat_arr is not None:
+        for block in sorted(set(block_arr)):
+            m = np.where(block_arr == block)[0]
+            for c in sorted(set(cat_arr[m])):
+                idx = m[cat_arr[m] == c]
+                cand = sorted({sentences[i] for i in idx})
+                if len(cand) < 5:
+                    continue
+                col = {s: i for i, s in enumerate(cand)}
+                tgt = torch.tensor([col[sentences[i]] for i in idx], device=device)
+                logits = eeg[torch.as_tensor(idx, device=device)] @ gather_text(
+                    cand, lookup, device
+                ).t()
+                cat_h1 += topk(logits, tgt, 1) * len(idx)
+                cat_h5 += topk(logits, tgt, 5) * len(idx)
+                cat_w += len(idx)
+                cat_sizes.append(len(cand))
+    metrics["e2t_cat@1"] = cat_h1 / cat_w if cat_w else float("nan")
+    metrics["e2t_cat@5"] = cat_h5 / cat_w if cat_w else float("nan")
+    metrics["n_cat_candidates"] = float(np.mean(cat_sizes)) if cat_sizes else float("nan")
+
+    # ---- within-(block, category, length)：再排除句长 ----
+    match_h1 = match_h5 = match_w = 0.0
+    match_sizes = []
+    if cat_arr is not None:
+        for block in sorted(set(block_arr)):
+            m = np.where(block_arr == block)[0]
+            for c in sorted(set(cat_arr[m])):
+                base = m[cat_arr[m] == c]
+                for L in sorted(set(len_arr[base])):
+                    idx = base[len_arr[base] == L]
+                    cand = sorted({sentences[i] for i in idx})
+                    if len(cand) < 2:
+                        continue
+                    col = {s: i for i, s in enumerate(cand)}
+                    tgt = torch.tensor([col[sentences[i]] for i in idx], device=device)
+                    logits = eeg[torch.as_tensor(idx, device=device)] @ gather_text(
+                        cand, lookup, device
+                    ).t()
+                    match_h1 += topk(logits, tgt, 1) * len(idx)
+                    match_h5 += topk(logits, tgt, 5) * len(idx)
+                    match_w += len(idx)
+                    match_sizes.append(len(cand))
+    metrics["e2t_match@1"] = match_h1 / match_w if match_w else float("nan")
+    metrics["e2t_match@5"] = match_h5 / match_w if match_w else float("nan")
+    metrics["n_match_candidates"] = (
+        float(np.mean(match_sizes)) if match_sizes else float("nan")
+    )
 
     # ---- 全局 text -> eeg（命中 = 前 k 名出现任意同句） ----
     uniq_arr = np.array(uniq, dtype=object)
@@ -371,15 +456,12 @@ def evaluate(model, debiaser, loader, lookup, device, temperature) -> dict:
     metrics["t2e_xday@1"] = x_hit1 / max(n_query, 1)
     metrics["t2e_xday@5"] = x_hit5 / max(n_query, 1)
 
-    # ---- 诊断：同句跨天 / 同块异句 / 跨块 的平均余弦 ----
+    # ---- 诊断余弦 ----
     sim = (eeg @ eeg.t()).float().cpu().numpy()
     day_eq = day_arr[:, None] == day_arr[None, :]
-    run_eq = run_arr[:, None] == run_arr[None, :]
     sent_eq = sent_arr[:, None] == sent_arr[None, :]
+    block_eq = block_arr[:, None] == block_arr[None, :]
     upper = np.triu(np.ones_like(sim, dtype=bool), 1)
-
-    same_block = (day_eq & run_eq)[upper]
-    same_sent = sent_eq[upper]
     same_sent_xday = (sent_eq & ~day_eq)[upper]
 
     def mean_of(mask) -> float:
@@ -387,12 +469,24 @@ def evaluate(model, debiaser, loader, lookup, device, temperature) -> dict:
         return float(values.mean()) if values.size else float("nan")
 
     metrics["cos_sent_xday"] = mean_of(same_sent_xday)
-    metrics["cos_same_block_diff_sent"] = mean_of(same_block & ~same_sent)
-    metrics["cos_diff_block"] = mean_of(~same_block)
-    # 关键对照：同句跨天 - 同块异句。>0 才说明句子身份独立于 run 块。
+    metrics["cos_same_block_diff_sent"] = mean_of(block_eq[upper] & ~sent_eq[upper])
+    metrics["cos_diff_block"] = mean_of(~block_eq[upper])
     metrics["cos_gap"] = (
         metrics["cos_sent_xday"] - metrics["cos_same_block_diff_sent"]
     )
+
+    if cat_arr is not None:
+        cat_eq = cat_arr[:, None] == cat_arr[None, :]
+        len_eq = len_arr[:, None] == len_arr[None, :]
+        metrics["cos_gap_cat"] = metrics["cos_sent_xday"] - mean_of(
+            block_eq[upper] & ~sent_eq[upper] & cat_eq[upper]
+        )
+        metrics["cos_gap_catlen"] = metrics["cos_sent_xday"] - mean_of(
+            block_eq[upper] & ~sent_eq[upper] & cat_eq[upper] & len_eq[upper]
+        )
+    else:
+        metrics["cos_gap_cat"] = float("nan")
+        metrics["cos_gap_catlen"] = float("nan")
 
     return metrics
 
@@ -446,14 +540,26 @@ def run_subject(args, subject, out_dir, text_encoder, device):
             f"{args.n_repeats} -> {n_repeats}，n_sentences 相应调整为 {n_sentences}"
         )
 
-    train_sampler = SentenceGroupBatchSampler(
-        train_sentences, n_sentences=n_sentences, n_repeats=n_repeats, seed=args.seed
-    )
-    print(
-        f"[Sampler] 每 batch {train_sampler.n_sentences} 句 × "
-        f"{train_sampler.n_repeats} 视图 = {train_sampler.batch_size} 条；每轮 "
-        f"{len(train_sampler)} 个 batch"
-    )
+    if args.length_negatives:
+        train_lengths = [int(dataset.meta["n_chars"].iloc[i]) for i in train_set.indices]
+        train_sampler = LengthBucketBatchSampler(
+            train_sentences, train_lengths,
+            n_sentences=n_sentences, n_repeats=n_repeats, seed=args.seed,
+        )
+        sizes = sorted((len(p) for p in train_sampler.buckets.values()), reverse=True)
+        print(
+            f"[Sampler] 句长分桶：{len(train_sampler.buckets)} 桶，句子数分布={sizes}；"
+            f"每 batch ≤ {n_sentences} 句 × {n_repeats} 视图；每轮 {len(train_sampler)} 个 batch"
+        )
+    else:
+        train_sampler = SentenceGroupBatchSampler(
+            train_sentences, n_sentences=n_sentences, n_repeats=n_repeats, seed=args.seed
+        )
+        print(
+            f"[Sampler] 每 batch {train_sampler.n_sentences} 句 × "
+            f"{train_sampler.n_repeats} 视图 = {train_sampler.batch_size} 条；每轮 "
+            f"{len(train_sampler)} 个 batch"
+        )
 
     train_loader = DataLoader(
         train_set, batch_sampler=train_sampler,
@@ -506,6 +612,16 @@ def run_subject(args, subject, out_dir, text_encoder, device):
             f"momentum={args.debias_momentum}"
         )
 
+    length_resid = None
+    if args.length_residual == "linear":
+        length_resid = LengthResidualizer(
+            embedding_dim, momentum=args.length_momentum
+        ).to(device)
+        print(f"[Length] 线性句长残差化，momentum={args.length_momentum}")
+
+    # 与 val_loader 的 shuffle=False 顺序一一对应
+    val_meta = dataset.meta.iloc[val_set.indices].reset_index(drop=True)
+
     n_params = sum(p.numel() for p in model.parameters())
     print(
         f"[Model] {type(model).__name__} 参数量={n_params:,} "
@@ -530,9 +646,8 @@ def run_subject(args, subject, out_dir, text_encoder, device):
     best_metrics = None
 
     header = (
-        f"{'epoch':>5} {'train':>8} {'pos':>5} {'val':>8} {'val_run':>8} "
-        f"{'e2t@1':>7} {'e2t_run@1':>9} {'e2t_run@5':>9} {'t2e@1':>7} "
-        f"{'t2e_xd@1':>8} {'gap':>7}"
+        f"{'epoch':>5} {'train':>8} {'val_run':>8} {'e2t_run@1':>9} "
+        f"{'e2t_cat@1':>9} {'e2t_match@1':>11} {'gap_cl':>7}"
     )
     print(f"\n{header}  (best by {args.select_by})")
     print("-" * len(header))
@@ -540,13 +655,16 @@ def run_subject(args, subject, out_dir, text_encoder, device):
     for epoch in range(1, args.epochs + 1):
         epoch_lr = optimizer.param_groups[0]["lr"]
         train_loss, train_pos, train_resid = train_one_epoch(
-            model, debiaser, train_loader, lookup, optimizer, device,
+            model, debiaser, length_resid, train_loader, lookup, optimizer, device,
             args.temperature, epoch=epoch, step_log_path=train_steps_path,
         )
         if scheduler is not None:
             scheduler.step()
 
-        metrics = evaluate(model, debiaser, val_loader, lookup, device, args.temperature)
+        metrics = evaluate(
+            model, debiaser, length_resid, val_loader, lookup, device,
+            args.temperature, val_meta,
+        )
         metrics["resid_norm"] = train_resid
 
         score = metrics[args.select_by]
@@ -564,6 +682,9 @@ def run_subject(args, subject, out_dir, text_encoder, device):
                         {group_key(d, r): i for (d, r), i in build_group_vocab(dataset.meta).items()}
                         if debiaser is not None else None
                     ),
+                    "length_residualizer": (
+                        length_resid.state_dict() if length_resid is not None else None
+                    ),
                     "args": vars(args),
                     "epoch": epoch,
                     "n_chans": dataset.n_chans,
@@ -575,11 +696,9 @@ def run_subject(args, subject, out_dir, text_encoder, device):
             )
 
         print(
-            f"{epoch:>5} {train_loss:>8.4f} {train_pos:>5.2f} "
-            f"{metrics['val_loss']:>8.4f} {metrics['val_loss_run']:>8.4f} "
-            f"{metrics['e2t@1']:>7.4f} {metrics['e2t_run@1']:>9.4f} "
-            f"{metrics['e2t_run@5']:>9.4f} {metrics['t2e@1']:>7.4f} "
-            f"{metrics['t2e_xday@1']:>8.4f} {metrics['cos_gap']:>+7.4f}{flag}"
+            f"{epoch:>5} {train_loss:>8.4f} {metrics['val_loss_run']:>8.4f} "
+            f"{metrics['e2t_run@1']:>9.4f} {metrics['e2t_cat@1']:>9.4f} "
+            f"{metrics['e2t_match@1']:>11.4f} {metrics['cos_gap_catlen']:>+7.4f}{flag}"
         )
 
         append_csv_row(train_epochs_path, EPOCH_LOG_FIELDS, {
@@ -593,6 +712,10 @@ def run_subject(args, subject, out_dir, text_encoder, device):
             "e2t@5": f"{metrics['e2t@5']:.6f}",
             "e2t_run@1": f"{metrics['e2t_run@1']:.6f}",
             "e2t_run@5": f"{metrics['e2t_run@5']:.6f}",
+            "e2t_cat@1": f"{metrics['e2t_cat@1']:.6f}",
+            "e2t_cat@5": f"{metrics['e2t_cat@5']:.6f}",
+            "e2t_match@1": f"{metrics['e2t_match@1']:.6f}",
+            "e2t_match@5": f"{metrics['e2t_match@5']:.6f}",
             "t2e@1": f"{metrics['t2e@1']:.6f}",
             "t2e@5": f"{metrics['t2e@5']:.6f}",
             "t2e_xday@1": f"{metrics['t2e_xday@1']:.6f}",
@@ -601,27 +724,34 @@ def run_subject(args, subject, out_dir, text_encoder, device):
             "cos_same_block_diff_sent": f"{metrics['cos_same_block_diff_sent']:+.6f}",
             "cos_diff_block": f"{metrics['cos_diff_block']:+.6f}",
             "cos_gap": f"{metrics['cos_gap']:+.6f}",
+            "cos_gap_cat": f"{metrics['cos_gap_cat']:+.6f}",
+            "cos_gap_catlen": f"{metrics['cos_gap_catlen']:+.6f}",
             "n_val": metrics["n_val"],
             "n_unique_sentences": metrics["n_unique_sentences"],
             "pos_per_anchor": f"{metrics['pos_per_anchor']:.4f}",
             "n_text_candidates": metrics["n_text_candidates"],
             "n_block_candidates": f"{metrics['n_block_candidates']:.1f}",
+            "n_cat_candidates": f"{metrics['n_cat_candidates']:.1f}",
+            "n_match_candidates": f"{metrics['n_match_candidates']:.1f}",
             "is_best": int(improved),
             "temperature": args.temperature,
             "debias": args.debias,
+            "length_negatives": int(args.length_negatives),
+            "length_residual": args.length_residual,
         })
 
-    n_cand = metrics["n_block_candidates"]
     print(
         f"\n[Done] best {args.select_by} = {best_score:.4f}\n"
-        f"       within-run 候选约 {n_cand:.0f} 句，随机基线 top-1≈{1 / n_cand:.4f} "
-        f"top-5≈{min(5, n_cand) / n_cand:.4f}\n"
-        f"       全局候选 {metrics['n_text_candidates']} 句，随机 top-1="
-        f"{1 / metrics['n_text_candidates']:.4f}\n"
-        f"       同句跨天 cos={best_metrics['cos_sent_xday']:+.3f}  "
-        f"同块异句 cos={best_metrics['cos_same_block_diff_sent']:+.3f}  "
-        f"跨块 cos={best_metrics['cos_diff_block']:+.3f}  "
-        f"gap={best_metrics['cos_gap']:+.3f}\n"
+        f"       同句跨天 cos={best_metrics['cos_sent_xday']:+.4f}  "
+        f"控类别 A-B={best_metrics['cos_gap_cat']:+.4f}  "
+        f"控类别+句长 A-B={best_metrics['cos_gap_catlen']:+.4f}\n"
+        f"       块内 e2t@1/5={best_metrics['e2t_run@1']:.4f}/"
+        f"{best_metrics['e2t_run@5']:.4f}（候选≈{best_metrics['n_block_candidates']:.0f}）\n"
+        f"       同类 e2t@1/5={best_metrics['e2t_cat@1']:.4f}/"
+        f"{best_metrics['e2t_cat@5']:.4f}（候选≈{best_metrics['n_cat_candidates']:.0f}）\n"
+        f"       同类同长 e2t@1={best_metrics['e2t_match@1']:.4f}"
+        f"（候选≈{best_metrics['n_match_candidates']:.0f}，随机≈1/候选；"
+        f"@5 在候选不足 5 时会饱和，见 CSV）\n"
         f"       checkpoint: {ckpt_path}\n"
         f"       epochs:     {train_epochs_path}"
     )
@@ -649,14 +779,26 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=1e-3)
     parser.add_argument("--lr-schedule", default="cosine", choices=["none", "cosine"])
     parser.add_argument(
-        "--select-by", default="cos_gap",
-        choices=["cos_gap", "val_loss", "val_loss_run", "e2t@1", "e2t_run@1", "e2t_run@5", "t2e@5"],
+        "--select-by", default="cos_gap_catlen",
+        choices=[
+            "cos_gap_catlen", "cos_gap_cat", "cos_gap",
+            "val_loss", "val_loss_run",
+            "e2t@1", "e2t_run@1", "e2t_run@5", "e2t_cat@1", "e2t_match@1", "t2e@5",
+        ],
         help=(
-            "选 best checkpoint 的指标（默认 cos_gap = 同句跨天余弦 - 同块异句余弦）。"
-            "val_loss_run 看似对口，但它会偏好'更平'的表示（logit 噪声会抬高损失），"
-            "实测容易选中未学动的 epoch；cos_gap 直接衡量句子身份是否独立于 run 块。"
+            "选 best checkpoint 的指标（默认 cos_gap_catlen = 同句跨天余弦 - 同块同类同长异句余弦）。"
+            "cos_gap 会被类别/句长混淆；控类别与句长后的 A-B 才是'句子身份'的干净度量。"
         ),
     )
+    parser.add_argument(
+        "--length-negatives", action="store_true",
+        help="按句长分桶采样：一个 batch 内句长相同，句长在 softmax 中失去判别力",
+    )
+    parser.add_argument(
+        "--length-residual", default="none", choices=["none", "linear"],
+        help="linear 表示在线估计并去掉 embedding 中线性可预测句长的方向",
+    )
+    parser.add_argument("--length-momentum", type=float, default=0.99)
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument(
         "--debias", default="ea+center", choices=["none", "ea", "center", "ea+center"],
@@ -681,7 +823,8 @@ def main():
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
     print(
         f"[Config] device={device} subjects={args.subject} days={args.day} "
-        f"debias={args.debias} temperature={args.temperature} "
+        f"debias={args.debias} length_neg={args.length_negatives} "
+        f"length_resid={args.length_residual} temperature={args.temperature} "
         f"batch={args.n_sentences}句×{args.n_repeats}视图 epochs={args.epochs} "
         f"lr={args.lr} select={args.select_by} seed={args.seed}"
     )
@@ -703,14 +846,13 @@ def main():
     if len(summary) > 1:
         print(f"\n{'=' * 92}\n[Summary] 被试对照（best by {args.select_by}）\n{'=' * 92}")
         print(
-            f"{'subject':>8} {'val_run':>9} {'e2t@1':>7} {'e2t_run@1':>10} "
-            f"{'e2t_run@5':>10} {'t2e_xday@1':>11} {'gap':>8}"
+            f"{'subject':>8} {'e2t_run@1':>10} {'e2t_cat@1':>10} "
+            f"{'e2t_match@1':>12} {'gap_catlen':>11}"
         )
         for subject, m in summary.items():
             print(
-                f"{subject:>8} {m['val_loss_run']:>9.4f} {m['e2t@1']:>7.4f} "
-                f"{m['e2t_run@1']:>10.4f} {m['e2t_run@5']:>10.4f} "
-                f"{m['t2e_xday@1']:>11.4f} {m['cos_gap']:>+8.3f}"
+                f"{subject:>8} {m['e2t_run@1']:>10.4f} {m['e2t_cat@1']:>10.4f} "
+                f"{m['e2t_match@1']:>12.4f} {m['cos_gap_catlen']:>+11.3f}"
             )
     print(f"\n[Output] {out_dir}")
 

@@ -100,3 +100,90 @@ class GroupDebiaser(nn.Module):
         with torch.no_grad():
             centered = embeddings - self.means[group_index.to(embeddings.device)]
             return float(centered.norm(dim=-1).mean())
+
+
+class LengthResidualizer(nn.Module):
+    """在线估计并去掉 embedding 中"线性可预测句长"的方向。
+
+    为什么需要它
+    ------------
+    run 与类别被去偏后，模型会退到下一个跨天完全一致的线索：**句长**。
+    本数据里 token 个数恰好等于字数（inner 为 ``n_chars + 1``），attention pooling
+    可以数 token；实测训练到后期，残差第一主成分与 ``n_chars`` 的相关可达 0.75。
+
+    做法
+    ----
+    用流式最小二乘估计"句长 -> embedding"的斜率方向 ``w``：
+
+        w ∝ Cov(e, n),   n = 句长
+
+    前向时去掉 embedding 在该方向上的投影：
+
+        e' = normalize(e - (e·ŵ) ŵ)
+
+    这不是把长度信息"藏起来"，而是让对比损失无法再用长度做判别。运行统计量用
+    EMA + 偏差校正，因此能跟上训练过程中表示的变化。
+
+    Parameters
+    ----------
+    dim:
+        embedding 维度。
+    momentum:
+        矩估计的 EMA 动量；0.99 约等于最近 100 个 batch。
+    eps:
+        方差下限，避免句长在 batch 内为常数（配合长度分桶采样时）导致除零。
+    """
+
+    def __init__(self, dim: int, momentum: float = 0.99, eps: float = 1e-6):
+        super().__init__()
+        if dim <= 0:
+            raise ValueError(f"dim 必须为正，收到 {dim}")
+        if not 0 <= momentum < 1:
+            raise ValueError(f"momentum 必须满足 0 <= m < 1，收到 {momentum}")
+
+        self.dim = int(dim)
+        self.momentum = float(momentum)
+        self.eps = float(eps)
+
+        self.register_buffer("direction", torch.zeros(dim))
+        self.register_buffer("ema_e", torch.zeros(dim))
+        self.register_buffer("ema_n", torch.zeros(()))
+        self.register_buffer("ema_nn", torch.zeros(()))
+        self.register_buffer("ema_ne", torch.zeros(dim))
+        self.register_buffer("updates", torch.zeros((), dtype=torch.long))
+
+    @torch.no_grad()
+    def update(self, embeddings: torch.Tensor, lengths: torch.Tensor) -> None:
+        """用当前 batch 更新"句长方向"的流式估计（不参与梯度）。"""
+        embeddings = embeddings.detach()
+        lengths = lengths.detach().to(embeddings.dtype).flatten()
+        m = self.momentum
+        t = int(self.updates) + 1
+        bias = 1.0 - m ** t
+
+        self.ema_e.mul_(m).add_(embeddings.mean(dim=0) * (1 - m))
+        self.ema_n.mul_(m).add_(lengths.mean() * (1 - m))
+        self.ema_nn.mul_(m).add_((lengths * lengths).mean() * (1 - m))
+        self.ema_ne.mul_(m).add_(
+            (lengths[:, None] * embeddings).mean(dim=0) * (1 - m)
+        )
+
+        mean_e = self.ema_e / bias
+        mean_n = self.ema_n / bias
+        mean_nn = self.ema_nn / bias
+        mean_ne = self.ema_ne / bias
+
+        cov = mean_ne - mean_n * mean_e
+        var = mean_nn - mean_n * mean_n
+        direction = cov / (var + self.eps)
+        self.direction.copy_(torch.nn.functional.normalize(direction, p=2, dim=0, eps=self.eps))
+        self.updates += 1
+
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """去掉沿句长方向的投影，再重新 L2 归一化。"""
+        if embeddings.ndim != 2:
+            raise ValueError(f"embeddings 必须是 (B, D)，收到 {tuple(embeddings.shape)}")
+        direction = self.direction.to(embeddings.device)
+        projection = embeddings @ direction
+        debiased = embeddings - projection.unsqueeze(1) * direction
+        return torch.nn.functional.normalize(debiased, p=2, dim=-1, eps=1e-6)
