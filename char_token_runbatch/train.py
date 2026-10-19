@@ -25,10 +25,10 @@ negative，使训练和验证的候选规模一致（252 路）。
 验证
 ----
 每个验证 run 的 63 条 EEG 作为 query，在全部 252 句文本里检索，报告
-e2t@1 / e2t@5 / mean_rank。每 ``--val-every`` 个 epoch 验证 ``--val-runs``
-个 run（默认 16 个，即全部验证 run，每个 epoch 都验满 1008 条 trial）；每
-``--split-half-every`` 个 epoch 用全部 16 个验证 run 算一次同句 split-half
-一致性。checkpoint 按验证 e2t@1 选择。
+e2t@1 / e2t@5 / mean_rank / median_rank。每 ``--val-every`` 个 epoch 验证
+``--val-runs`` 个 run（默认 16 个，即全部验证 run，每个 epoch 都验满 1008 条
+trial）；每 ``--split-half-every`` 个 epoch 用全部 16 个验证 run 算一次同句
+split-half 一致性。checkpoint 按验证 median_rank 选择（并列时比 e2t@5）。
 
 本目录自带以下文件，不依赖外部实验代码：
 
@@ -88,7 +88,8 @@ DEFAULT_OUT_DIR = PROJECT_ROOT / "outputs" / "char_token_runbatch"
 EPOCH_FIELDS = [
     "epoch", "lr", "train_loss", "pos_per_anchor",
     "n_batches", "mean_batch_size", "temperature",
-    "val_e2t1", "val_e2t5", "val_mean_rank", "val_loss_e2t", "val_n",
+    "val_e2t1", "val_e2t5", "val_mean_rank", "val_median_rank",
+    "val_loss_e2t", "val_n",
 ]
 STEP_FIELDS = [
     "epoch", "step", "day", "run", "loss", "lr", "pos_per_anchor", "batch_size",
@@ -257,6 +258,7 @@ def retrieval_metrics(eeg, gallery, targets, temperature: float) -> dict:
         "e2t1": float((rank == 1).float().mean()),
         "e2t5": float((rank <= 5).float().mean()),
         "mean_rank": float(rank.float().mean()),
+        "median_rank": float(rank.float().median()),
         "loss_e2t": float(loss),
     }
 
@@ -496,7 +498,7 @@ def main():
         f"{'batches':>7} {'mean_bs':>8}"
     )
     if val_groups:
-        header += f" {'val@1':>8} {'val@5':>8} {'val_rank':>9}"
+        header += f" {'val@1':>8} {'val@5':>8} {'val_rank':>9} {'val_med':>8}"
     print(f"\n{header}")
     print("-" * len(header))
 
@@ -590,7 +592,8 @@ def main():
                 f"        [Val] run={','.join(f'day{d}run{r}' for d, r in chosen)} "
                 f"n={val_metrics['n']} e2t@1={val_metrics['e2t1']:.4f} "
                 f"e2t@5={val_metrics['e2t5']:.4f} "
-                f"mean_rank={val_metrics['mean_rank']:.1f}"
+                f"mean_rank={val_metrics['mean_rank']:.1f} "
+                f"median_rank={val_metrics['median_rank']:.1f}"
             )
 
         # ---------------- split-half ----------------
@@ -632,6 +635,7 @@ def main():
             "val_e2t1": "" if val_metrics is None else f"{val_metrics['e2t1']:.6f}",
             "val_e2t5": "" if val_metrics is None else f"{val_metrics['e2t5']:.6f}",
             "val_mean_rank": "" if val_metrics is None else f"{val_metrics['mean_rank']:.6f}",
+            "val_median_rank": "" if val_metrics is None else f"{val_metrics['median_rank']:.6f}",
             "val_loss_e2t": "" if val_metrics is None else f"{val_metrics['loss_e2t']:.6f}",
             "val_n": "" if val_metrics is None else val_metrics["n"],
         }
@@ -643,11 +647,12 @@ def main():
         )
         if val_groups:
             if val_metrics is None:
-                line += f" {'-':>8} {'-':>8} {'-':>9}"
+                line += f" {'-':>8} {'-':>8} {'-':>9} {'-':>8}"
             else:
                 line += (
                     f" {val_metrics['e2t1']:>8.4f} {val_metrics['e2t5']:>8.4f} "
-                    f"{val_metrics['mean_rank']:>9.1f}"
+                    f"{val_metrics['mean_rank']:>9.1f} "
+                    f"{val_metrics['median_rank']:>8.1f}"
                 )
         print(line)
         if val_detail:
@@ -673,19 +678,21 @@ def main():
             torch.save(ckpt, best_train_path)
             print(f"        * new best train_loss={best_train:.6f}")
         if val_metrics is not None:
-            score = (val_metrics["e2t1"], -val_metrics["mean_rank"])
+            # 主键 median_rank（越小越好），并列时比 e2t@5（越大越好）
+            score = (-val_metrics["median_rank"], val_metrics["e2t5"])
             if best_val_score is None or score > best_val_score:
                 best_val_score = score
                 torch.save(ckpt, best_val_path)
                 print(
-                    f"        * new best val e2t@1={val_metrics['e2t1']:.4f} "
-                    f"mean_rank={val_metrics['mean_rank']:.1f}"
+                    f"        * new best val median_rank={val_metrics['median_rank']:.1f} "
+                    f"e2t@5={val_metrics['e2t5']:.4f}"
                 )
 
     print(
         f"\n[Done] best train_loss={best_train:.6f}"
         + (
-            f"  best val e2t@1={best_val_score[0]:.4f}" if best_val_score else ""
+            f"  best val median_rank={-best_val_score[0]:.1f} "
+            f"e2t@5={best_val_score[1]:.4f}" if best_val_score else ""
         )
         + f"\n       last      : {last_path}"
         + f"\n       best train: {best_train_path}"
