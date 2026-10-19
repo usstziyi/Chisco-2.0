@@ -71,7 +71,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
 
 def subject_from_ckpt(path: Path) -> str:
     stem = path.stem
-    for suffix in ("_best_train", "_best", "_last"):
+    for suffix in ("_best_train", "_best_val", "_best", "_last"):
         if stem.endswith(suffix):
             return stem[: -len(suffix)]
     return stem
@@ -84,11 +84,14 @@ def find_ckpt(ckpt: str | None, subject: str | None) -> Path:
             raise FileNotFoundError(f"checkpoint 不存在: {path}")
         return path
 
-    name = f"{subject}_best_train.pt" if subject else "*_best_train.pt"
-    candidates = sorted(OUT_ROOT.glob(f"*/{name}"), key=lambda p: p.parent.name)
-    if not candidates:
-        raise FileNotFoundError(f"{OUT_ROOT} 下没有 */{name}，请用 --ckpt 指定")
-    return candidates[-1]
+    prefix = f"{subject}" if subject else "*"
+    for name in (f"{prefix}_best_val.pt", f"{prefix}_best_train.pt"):
+        candidates = sorted(OUT_ROOT.glob(f"*/{name}"), key=lambda p: p.parent.name)
+        if candidates:
+            return candidates[-1]
+    raise FileNotFoundError(
+        f"{OUT_ROOT} 下没有 */{prefix}_best_val.pt 或 */{prefix}_best_train.pt，请用 --ckpt 指定"
+    )
 
 
 def resolve_config(args) -> dict:
@@ -171,10 +174,17 @@ def load_model(ckpt: dict, dataset: CharTokenEEGDataset | None, device) -> CharT
 def load_meta(dataset: CharTokenEEGDataset) -> pd.DataFrame:
     """dataset.meta 补上 category_name / category_number（用于按类别排序）。"""
     meta = dataset.meta.copy()
+    missing = [
+        column for column in ("category_name", "category_number")
+        if column not in meta.columns
+    ]
+    if not missing:
+        return meta
+
     table = pd.read_csv(TEXT_TABLE, sep="\t")
     key = ["sample", "subject", "day", "run", "trial_index"]
     return meta.merge(
-        table[key + ["category_name", "category_number"]],
+        table[key + missing],
         on=key, how="left", validate="many_to_one",
     )
 

@@ -78,12 +78,40 @@ def contrastive_loss(
     text: torch.Tensor,
     temperature: float,
     groups: torch.Tensor | None = None,
+    gallery: torch.Tensor | None = None,
+    targets: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """多正样本对称 InfoNCE：EEG->文本 与 文本->EEG 两个方向取平均。"""
-    logits = eeg @ text.t() / temperature
+    """多正样本对称 InfoNCE：EEG->文本 与 文本->EEG 两个方向取平均。
+
+    默认 ``gallery=None``：EEG->文本方向的候选就是本 batch 的 ``text``，
+    与旧行为一致。
+
+    给定 ``gallery`` 与 ``targets`` 时，EEG->文本方向改用更大的候选池
+    （例如全部 252 句），``targets[i]`` 是第 i 条 EEG 在 ``gallery`` 中的列号；
+    文本->EEG 方向仍只在本 batch 内计算。这样训练与验证的候选规模可以一致，
+    同时验证句的文本只作为负样本、不携带任何 EEG。
+    """
+    text_e2t = text if gallery is None else gallery
+    logits_e2t = eeg @ text_e2t.t() / temperature
+
+    if targets is None:
+        if groups is None:
+            groups = torch.arange(logits_e2t.size(0), device=logits_e2t.device)
+        positive_e2t = (groups[:, None] == groups[None, :]).to(logits_e2t.dtype)
+    else:
+        if targets.ndim != 1 or targets.numel() != logits_e2t.size(0):
+            raise ValueError(
+                f"targets 形状 {tuple(targets.shape)} 与 EEG 行数 {logits_e2t.size(0)} 不匹配"
+            )
+        positive_e2t = torch.zeros_like(logits_e2t)
+        positive_e2t.scatter_(1, targets[:, None], 1.0)
+
+    logits_t2e = text @ eeg.t() / temperature
     if groups is None:
-        groups = torch.arange(logits.size(0), device=logits.device)
-    positive = (groups[:, None] == groups[None, :]).to(logits.dtype)
+        groups = torch.arange(logits_t2e.size(0), device=logits_t2e.device)
+    positive_t2e = (groups[:, None] == groups[None, :]).to(logits_t2e.dtype)
+
     return 0.5 * (
-        _multi_positive_ce(logits, positive) + _multi_positive_ce(logits.t(), positive)
+        _multi_positive_ce(logits_e2t, positive_e2t)
+        + _multi_positive_ce(logits_t2e, positive_t2e)
     )

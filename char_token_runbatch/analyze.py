@@ -25,7 +25,7 @@
 用法::
 
     uv run python char_token_runbatch/analyze.py
-    uv run python char_token_runbatch/analyze.py --ckpt outputs/char_token_runbatch/<ts>/sub-01_best_train.pt
+    uv run python char_token_runbatch/analyze.py --ckpt outputs/char_token_runbatch/<ts>/sub-01_best_val.pt
     uv run python char_token_runbatch/analyze.py --baseline none
 """
 
@@ -62,7 +62,6 @@ from char_token_runbatch.text_encoder import LaBSETextEncoder
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 OUT_ROOT = PROJECT_ROOT / "outputs" / "char_token_runbatch"
-TEXT_TABLE = PROJECT_ROOT / "datasets" / "preprocessed" / "all_text.tsv"
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -72,13 +71,16 @@ plt.rcParams["axes.unicode_minus"] = False
 
 
 def find_latest(subject: str) -> Path:
-    candidates = sorted(
-        OUT_ROOT.glob(f"*/{subject}_best_train.pt"),
-        key=lambda p: p.parent.name,
+    for name in (f"{subject}_best_val.pt", f"{subject}_best_train.pt"):
+        candidates = sorted(
+            OUT_ROOT.glob(f"*/{name}"),
+            key=lambda p: p.parent.name,
+        )
+        if candidates:
+            return candidates[-1]
+    raise FileNotFoundError(
+        f"{OUT_ROOT} 下没有 */{subject}_best_val.pt 或 */{subject}_best_train.pt"
     )
-    if not candidates:
-        raise FileNotFoundError(f"{OUT_ROOT} 下没有 */{subject}_best_train.pt")
-    return candidates[-1]
 
 
 def load_encoder(ckpt_path: Path, device) -> tuple[CharTokenEEGEncoder, dict]:
@@ -488,6 +490,14 @@ def main():
     char_duration = float(train_args.get("char_duration", 0.4))
 
     print(f"[Ckpt] {ckpt_path} (epoch={ckpt.get('epoch')}, train_loss={float(ckpt.get('train_loss', float('nan'))):.4f})")
+    val_metrics = ckpt.get("val_metrics")
+    if val_metrics:
+        print(
+            f"[Val ] e2t@1={val_metrics['e2t1']:.4f} "
+            f"e2t@5={val_metrics['e2t5']:.4f} "
+            f"mean_rank={val_metrics['mean_rank']:.1f} "
+            f"n={val_metrics['n']}（留出 {len(ckpt.get('val_sentences', []))} 句）"
+        )
     print(f"[Cfg ] days={days} event={event} device={device}")
 
     # ---------------- 数据 ----------------
@@ -497,14 +507,6 @@ def main():
     )
     dataset[0]  # 触发一次读取，确定 n_chans
     meta = dataset.meta.copy()
-
-    # 类别/文本表 merge（dataset.meta 不含 category）
-    text_table = pd.read_csv(TEXT_TABLE, sep="\t")
-    key = ["sample", "subject", "day", "run", "trial_index"]
-    meta = meta.merge(
-        text_table[key + ["category_number", "category_name"]],
-        on=key, how="left", validate="many_to_one",
-    )
 
     sentences = meta["sentence"].tolist()
     unique_sentences = sorted(set(sentences))

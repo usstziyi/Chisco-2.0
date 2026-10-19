@@ -104,7 +104,8 @@ class CharTokenEEGDataset(Dataset):
     n_chans:
         传感器（EEG）通道数，读取首条样本后确定。
     meta:
-        与样本一一对应的元数据，含 ``n_tokens`` 列。
+        与样本一一对应的元数据，含 ``n_tokens``、``category_number``、
+        ``category_name`` 等列。
     """
 
     def __init__(
@@ -162,7 +163,10 @@ class CharTokenEEGDataset(Dataset):
         self.n_chans: int | None = None
 
         self.meta = subset[
-            ["sample", "subject", "day", "run", "trial_index", "sentence", "n_chars"]
+            [
+                "sample", "subject", "day", "run", "trial_index",
+                "sentence", "category_number", "category_name", "n_chars",
+            ]
         ].copy()
         self.meta["event"] = event
         self.meta["start_sample"] = subset[self.sample_col].astype(int)
