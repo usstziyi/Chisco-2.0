@@ -41,8 +41,7 @@
     # 句长控制：同长负样本 / 线性残差化 / 两者叠加
     uv run python char_token_debias/train.py --day 1 2 3 4 --debias center --length-negatives
     uv run python char_token_debias/train.py --day 1 2 3 4 --debias center --length-residual linear
-    uv run python char_token_debias/train.py --day 1 2 3 4 --debias center \
-        --length-negatives --length-residual linear
+    uv run python char_token_debias/train.py --day 1 2 3 4 --debias center --length-negatives --length-residual linear
 
     # 快速冒烟
     uv run python char_token_debias/train.py --day 1 2 --n-sentences 8 --n-repeats 2 \
