@@ -26,7 +26,7 @@ negative，使训练和验证的候选规模一致（252 路）。
 ----
 每个验证 run 的 63 条 EEG 作为 query，在全部 252 句文本里检索，报告
 e2t@1 / e2t@5 / mean_rank。每 ``--val-every`` 个 epoch 验证 ``--val-runs``
-个 run（默认 4 个，按字典序轮换，4 个 epoch 走完 16 个 run）；每
+个 run（默认 16 个，即全部验证 run，每个 epoch 都验满 1008 条 trial）；每
 ``--split-half-every`` 个 epoch 用全部 16 个验证 run 算一次同句 split-half
 一致性。checkpoint 按验证 e2t@1 选择。
 
@@ -43,7 +43,7 @@ e2t@1 / e2t@5 / mean_rank。每 ``--val-every`` 个 epoch 验证 ``--val-runs``
 
     uv run python char_token_runbatch/train.py
     uv run python char_token_runbatch/train.py --epochs 50
-    uv run python char_token_runbatch/train.py --epochs 50 --val-runs 4 --val-every 1  # 每 1 epoch 用 4 个 run 验证
+    uv run python char_token_runbatch/train.py --epochs 50 --val-runs 16 --val-every 1  # 每 epoch 验证全部 16 个 run
     uv run python char_token_runbatch/train.py --val-fraction 0        # 关闭验证
     uv run python char_token_runbatch/train.py --val-split path/to.json
     uv run python char_token_runbatch/train.py --max-per-run 16 --max-steps 1 --split-half-every 0  # 冒烟
@@ -202,8 +202,8 @@ def parse_args():
         help="每多少个 epoch 验证一次（默认 1）",
     )
     parser.add_argument(
-        "--val-runs", type=int, default=4,
-        help="每次验证使用多少个 run（默认 4，按字典序轮换）",
+        "--val-runs", type=int, default=16,
+        help="每次验证使用多少个 run（默认 16，即全部；按字典序轮换）",
     )
     parser.add_argument(
         "--eval-batch-size", type=int, default=32,
