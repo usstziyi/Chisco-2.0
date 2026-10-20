@@ -346,6 +346,7 @@ def main():
         "rsa_with_labse": rsa,
         "prediction_hubs": hub_stats,
         "ckpt_stored_val_metrics": cfg["ckpt"].get("val_metrics"),
+        "ckpt_stored_train_metrics": cfg["ckpt"].get("train_metrics"),
     }
     out_json = out_dir / f"{tag}_metrics.json"
     out_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -362,12 +363,16 @@ def main():
           f"margin={m63['margin']:+.4f}")
     print(f"  trial 级（1008 条）：top1={m63_trial['top1']:.4f}  top5={m63_trial['top5']:.4f}  "
           f"mean_rank={m63_trial['mean_rank']:.1f}")
-    print(f"  252 路 trial 级（训练时的口径）：top1={m252_trial['top1']:.4f}  "
+    print(f"  252 路 trial 级（63 留出 + 189 训练）：top1={m252_trial['top1']:.4f}  "
           f"top5={m252_trial['top5']:.4f}  mean_rank={m252_trial['mean_rank']:.1f}")
     if cfg["ckpt"].get("val_metrics"):
         vm = cfg["ckpt"]["val_metrics"]
-        print(f"  checkpoint 记录：top1={vm['e2t1']:.4f}  top5={vm['e2t5']:.4f}  "
+        print(f"  checkpoint 记录（val63 口径）：top1={vm['e2t1']:.4f}  top5={vm['e2t5']:.4f}  "
               f"mean_rank={vm['mean_rank']:.1f}  n={vm['n']}")
+    if cfg["ckpt"].get("train_metrics"):
+        tm = cfg["ckpt"]["train_metrics"]
+        print(f"  checkpoint 记录（train189 口径）：top1={tm['e2t1']:.4f}  top5={tm['e2t5']:.4f}  "
+              f"mean_rank={tm['mean_rank']:.1f}  n={tm['n']}")
 
     print("\n" + "=" * 74)
     print("二、没见过的句子在 EEG 空间里稳不稳")

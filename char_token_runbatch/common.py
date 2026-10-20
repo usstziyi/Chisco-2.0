@@ -1,13 +1,15 @@
 """从训练脚本中抽出的通用工具，供本目录独立使用。
 
-包含：CSV/JSON 记录、随机种子、LaBSE 文本查表、按句子取文本、句子分组 id，
-以及多正样本对称 InfoNCE。本目录不 import 任何外部实验代码。
+包含：CSV/JSON 记录、随机种子、LaBSE 文本查表、按句子取文本、句子分组 id、
+多正样本对称 InfoNCE，以及方阵 Sinkhorn（entropic OT）损失。
+本目录不 import 任何外部实验代码。
 """
 
 from __future__ import annotations
 
 import csv
 import json
+import math
 import random
 from pathlib import Path
 
@@ -115,3 +117,60 @@ def contrastive_loss(
         _multi_positive_ce(logits_e2t, positive_e2t)
         + _multi_positive_ce(logits_t2e, positive_t2e)
     )
+
+
+def sinkhorn_loss(
+    eeg: torch.Tensor,
+    text: torch.Tensor,
+    epsilon: float = 0.05,
+    n_iters: int = 50,
+) -> torch.Tensor:
+    """方阵 Sinkhorn（entropic optimal transport）损失：强制 EEG 与文本一一匹配。
+
+    代价取余弦距离 ``C = 1 - eeg @ text.T``（两侧都已 L2 归一化），query 与
+    gallery 的边际都取均匀分布 ``1/N``。与 InfoNCE 的关键差别是**列边际也被
+    约束**：任何一句文本能分到的概率质量上限是 ``1/N``，几个 hub 无法吸走
+    所有 query，从而避免预测塌缩。
+
+    在 log-domain 里交替更新对偶变量 ``f, g``，共 ``n_iters`` 轮，梯度可正常
+    反传（固定迭代次数的近似解）。返回 ``<P, C>``，数值落在 ``[0, 2]``，与
+    InfoNCE 的 loss 不可直接比较。
+
+    Parameters
+    ----------
+    eeg, text:
+        ``(N, D)``，同一 run 的 N 条 EEG 与对应的 N 条文本 embedding。
+    epsilon:
+        熵正则强度；越小越接近硬分配（匈牙利），越大越平滑。
+    n_iters:
+        Sinkhorn 迭代次数。
+    """
+    if eeg.shape != text.shape:
+        raise ValueError(
+            f"Sinkhorn 需要方阵：eeg {tuple(eeg.shape)} vs text {tuple(text.shape)}"
+        )
+    if eeg.ndim != 2:
+        raise ValueError(f"embedding 必须是二维，收到 {tuple(eeg.shape)}")
+    if epsilon <= 0:
+        raise ValueError(f"epsilon 必须为正，收到 {epsilon}")
+    if n_iters < 1:
+        raise ValueError(f"n_iters 必须 >= 1，收到 {n_iters}")
+
+    n = eeg.size(0)
+    cost = 1.0 - eeg @ text.t()  # (N, N)
+    log_marginal = cost.new_full((n,), -math.log(n))
+    f = cost.new_zeros(n)
+    g = cost.new_zeros(n)
+
+    for _ in range(n_iters):
+        f = epsilon * (
+            log_marginal
+            - torch.logsumexp((g[None, :] - cost) / epsilon, dim=1)
+        )
+        g = epsilon * (
+            log_marginal
+            - torch.logsumexp((f[:, None] - cost) / epsilon, dim=0)
+        )
+
+    plan = torch.exp((f[:, None] + g[None, :] - cost) / epsilon)
+    return (plan * cost).sum()

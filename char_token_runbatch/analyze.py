@@ -493,10 +493,18 @@ def main():
     val_metrics = ckpt.get("val_metrics")
     if val_metrics:
         print(
-            f"[Val ] e2t@1={val_metrics['e2t1']:.4f} "
+            f"[Val63] e2t@1={val_metrics['e2t1']:.4f} "
             f"e2t@5={val_metrics['e2t5']:.4f} "
             f"mean_rank={val_metrics['mean_rank']:.1f} "
             f"n={val_metrics['n']}（留出 {len(ckpt.get('val_sentences', []))} 句）"
+        )
+    train_metrics = ckpt.get("train_metrics")
+    if train_metrics:
+        print(
+            f"[Trn189] e2t@1={train_metrics['e2t1']:.4f} "
+            f"e2t@5={train_metrics['e2t5']:.4f} "
+            f"mean_rank={train_metrics['mean_rank']:.1f} "
+            f"n={train_metrics['n']}（训练句）"
         )
     print(f"[Cfg ] days={days} event={event} device={device}")
 
